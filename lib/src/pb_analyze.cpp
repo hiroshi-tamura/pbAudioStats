@@ -3,6 +3,7 @@
  */
 
 #include "pb_audio_stats.h"
+#include "pb_simd.h"
 #include <filesystem>
 
 namespace fs = std::filesystem;

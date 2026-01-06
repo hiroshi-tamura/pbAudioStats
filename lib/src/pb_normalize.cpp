@@ -3,9 +3,11 @@
  * Supports Peak, True Peak, Integrated Loudness, Short-term, Momentary, RMS
  *
  * WAV/AIFF: Native implementation (no external dependencies)
+ * SIMD optimizations: Uses pb_simd.h for accelerated gain application.
  */
 
 #include "pb_audio_stats.h"
+#include "pb_simd.h"
 #include <cmath>
 #include <fstream>
 #include <cstring>

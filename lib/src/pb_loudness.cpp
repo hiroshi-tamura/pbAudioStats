@@ -13,6 +13,7 @@
  */
 
 #include "pb_audio_stats.h"
+#include "pb_simd.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -615,21 +616,13 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
     const int channels = audio.channels;
 
     // Track sample peak from ORIGINAL audio (pre-loop, pre-filter)
-    double sample_peak_linear = 0.0;
-    const float* orig_samples = audio.samples.data();
-    for (size_t frame = 0; frame < audio.total_frames; ++frame) {
-        const float* frame_samples = orig_samples + frame * channels;
-        for (int ch = 0; ch < channels; ++ch) {
-            double abs_sample = std::fabs(static_cast<double>(frame_samples[ch]));
-            if (abs_sample > sample_peak_linear) {
-                sample_peak_linear = abs_sample;
-            }
-        }
-    }
+    // Use SIMD-optimized peak detection for all interleaved samples
+    const size_t total_samples = audio.total_frames * static_cast<size_t>(channels);
+    float sample_peak_linear = simd::find_peak_abs(audio.samples.data(), total_samples);
 
     // Convert sample peak to dBFS
-    if (sample_peak_linear > 0.0) {
-        result.sample_peak = 20.0 * std::log10(sample_peak_linear);
+    if (sample_peak_linear > 0.0f) {
+        result.sample_peak = 20.0 * std::log10(static_cast<double>(sample_peak_linear));
     } else {
         result.sample_peak = -std::numeric_limits<double>::infinity();
     }

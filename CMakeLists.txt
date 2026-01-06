@@ -9,14 +9,37 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Optimization flags
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    if(MSVC)
-        # Note: /GL and /LTCG removed to avoid issues with header-only libraries (dr_mp3)
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
-    else()
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG -flto")
+# ============================================================================
+# SIMD Compiler Flags
+# ============================================================================
+if(MSVC)
+    # MSVC: Enable AVX2 for x86-64
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        add_compile_options(/arch:AVX2)
     endif()
+else()
+    # GCC/Clang
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        # x86-64: Enable AVX2 and FMA
+        add_compile_options(-mavx2 -mfma)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+        # ARM64: NEON is enabled by default, no additional flags needed
+    endif()
+endif()
+
+# ============================================================================
+# Optimization flags and LTO (Link Time Optimization)
+# ============================================================================
+if(MSVC)
+    # MSVC Release optimization
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
+    # MSVC LTO (Whole Program Optimization) - use with caution for header-only libs
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+else()
+    # GCC/Clang Release optimization
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+    # Enable LTO for Release builds (GCC/Clang)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 endif()
 
 # External headers (dr_libs)

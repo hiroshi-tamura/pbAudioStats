@@ -5,9 +5,12 @@
  * instead of ITU-R BS.1770-4 inter-sample peak detection.
  *
  * SOX compatible: Finds the maximum absolute sample value and converts to dB.
+ *
+ * SIMD optimizations: Uses pb_simd.h for accelerated peak detection.
  */
 
 #include "pb_audio_stats.h"
+#include "pb_simd.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -27,19 +30,14 @@ double TruePeakMeter::measure(const AudioData& audio) {
     if (audio.samples.empty()) return -100.0;
 
     size_t total_samples = audio.samples.size();
-    double max_peak = 0.0;
 
-    // Find maximum absolute sample value across all channels
-    for (size_t i = 0; i < total_samples; i++) {
-        double abs_val = std::fabs(static_cast<double>(audio.samples[i]));
-        if (abs_val > max_peak) {
-            max_peak = abs_val;
-        }
-    }
+    // Use SIMD-optimized peak detection
+    // pb_audio::simd::find_peak_abs() uses AVX2/NEON/scalar depending on platform
+    float max_peak = simd::find_peak_abs(audio.samples.data(), total_samples);
 
     // Convert to dB
-    if (max_peak <= 0.0) return -100.0;
-    return 20.0 * std::log10(max_peak);
+    if (max_peak <= 0.0f) return -100.0;
+    return 20.0 * std::log10(static_cast<double>(max_peak));
 }
 
 // ============================================================================

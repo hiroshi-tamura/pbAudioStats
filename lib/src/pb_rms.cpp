@@ -16,6 +16,7 @@
  */
 
 #include "pb_audio_stats.h"
+#include "pb_simd.h"
 #include <cmath>
 #include <limits>
 #include <algorithm>
@@ -103,11 +104,16 @@ RMSMeter::Result RMSMeter::measure(const AudioData& audio, double window_ms) {
 
     // Calculate Overall values (SOX method)
     // RMS lev dB: combine all channels
+    // Use SIMD-optimized sum of squares for overall RMS calculation
     double total_sum_sq = 0.0;
-    uint64_t total_sample_count = 0;
-    for (uint32_t ch = 0; ch < channels; ch++) {
-        total_sum_sq += sum_sq[ch];
-        total_sample_count += sample_count[ch];
+    uint64_t total_sample_count = static_cast<uint64_t>(audio.samples.size());
+
+    if (channels == 2) {
+        // Use optimized stereo sum of squares
+        total_sum_sq = simd::weighted_sum_of_squares_stereo(audio.samples.data(), total_frames);
+    } else {
+        // Use optimized sum of squares for all samples
+        total_sum_sq = simd::sum_of_squares(audio.samples.data(), audio.samples.size());
     }
 
     if (total_sample_count > 0 && total_sum_sq > 0.0) {
