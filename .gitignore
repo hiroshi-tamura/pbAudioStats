@@ -1,3 +1,7 @@
+# Build output
+build_mac/
+build_win/
+
 # Build intermediates
 CMakeCache.txt
 CMakeFiles/
