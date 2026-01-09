@@ -15,6 +15,10 @@ namespace pb_audio {
 // ============================================================================
 
 AudioStats analyze(const std::string& filepath) {
+    return analyze(filepath, false);
+}
+
+AudioStats analyze(const std::string& filepath, bool use_single_pass) {
     AudioStats stats;
 
     // File info
@@ -51,22 +55,35 @@ AudioStats analyze(const std::string& filepath) {
     stats.duration_seconds = audio->duration_seconds();
     stats.duration_formatted = format_duration(stats.duration_seconds);
 
-    // Loudness measurement (BS.1770-4)
-    auto loudness = LoudnessMeter::measure(*audio);
-    stats.integrated_loudness = loudness.integrated;
-    stats.shortterm_max = loudness.shortterm_max;
-    stats.momentary_max = loudness.momentary_max;
-    stats.loudness_range = loudness.range;
-    stats.sample_peak = loudness.sample_peak;
+    if (!use_single_pass) {
+        auto loudness = LoudnessMeter::measure(*audio);
+        stats.integrated_loudness = loudness.integrated;
+        stats.shortterm_max = loudness.shortterm_max;
+        stats.momentary_max = loudness.momentary_max;
+        stats.loudness_range = loudness.range;
+        stats.sample_peak = loudness.sample_peak;
 
-    // True Peak measurement
-    stats.true_peak = TruePeakMeter::measure(*audio);
+        stats.true_peak = stats.sample_peak;
 
-    // RMS measurement (50ms window like SOX)
-    auto rms = RMSMeter::measure(*audio, 50.0);
-    stats.rms_min = rms.min_db;
-    stats.rms_max = rms.max_db;
-    stats.rms_average = rms.average_db;
+        auto rms = RMSMeter::measure(*audio, 50.0);
+        stats.rms_min = rms.min_db;
+        stats.rms_max = rms.max_db;
+        stats.rms_average = rms.average_db;
+    } else {
+        // Single pass is faster for short files
+        auto loudness = LoudnessMeter::measure_with_rms(*audio, 50.0);
+        stats.integrated_loudness = loudness.loudness.integrated;
+        stats.shortterm_max = loudness.loudness.shortterm_max;
+        stats.momentary_max = loudness.loudness.momentary_max;
+        stats.loudness_range = loudness.loudness.range;
+        stats.sample_peak = loudness.loudness.sample_peak;
+
+        stats.true_peak = stats.sample_peak;
+
+        stats.rms_min = loudness.rms_min;
+        stats.rms_max = loudness.rms_max;
+        stats.rms_average = loudness.rms_average;
+    }
 
     return stats;
 }

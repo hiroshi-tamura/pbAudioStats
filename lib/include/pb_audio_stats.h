@@ -92,7 +92,15 @@ public:
         double sample_peak;      // dBFS
     };
 
+    struct ExtendedResult {
+        Result loudness;
+        double rms_min;
+        double rms_max;
+        double rms_average;
+    };
+
     static Result measure(const AudioData& audio);
+    static ExtendedResult measure_with_rms(const AudioData& audio, double window_ms = 50.0);
 
 private:
     // K-weighting filter coefficients
@@ -171,6 +179,7 @@ public:
 
 // Analyze single file
 AudioStats analyze(const std::string& filepath);
+AudioStats analyze(const std::string& filepath, bool use_single_pass);
 
 // Utility functions
 std::string format_duration(double seconds);

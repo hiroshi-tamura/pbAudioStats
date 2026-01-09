@@ -378,28 +378,51 @@ static void output_stats(const Config& config, const AudioStats& stats, std::ost
 // Parallel Processing
 // ============================================================================
 
-static void process_files_parallel(const std::vector<std::string>& files,
-                                   const Config& config,
-                                   std::vector<AudioStats>& results) {
-    int num_threads = config.num_threads;
-    if (num_threads <= 0) {
-        num_threads = std::max(1, (int)std::thread::hardware_concurrency());
-    }
+static void process_files_range_serial(const std::vector<std::string>& files,
+                                       size_t start,
+                                       size_t end,
+                                       std::vector<AudioStats>& results,
+                                       std::atomic<size_t>* completed,
+                                       std::mutex* progress_mutex,
+                                       size_t print_every,
+                                       bool use_single_pass) {
+    for (size_t idx = start; idx < end; ++idx) {
+        results[idx] = analyze(files[idx], use_single_pass);
 
-    results.resize(files.size());
-    std::atomic<size_t> next_index(0);
-    std::atomic<size_t> completed(0);
-    std::mutex progress_mutex;
+        if (completed && progress_mutex) {
+            size_t done = ++(*completed);
+            if (done % print_every == 0 || done == files.size()) {
+                std::lock_guard<std::mutex> lock(*progress_mutex);
+                std::cerr << "\rProcessing: " << done << "/" << files.size() << " files..." << std::flush;
+            }
+        }
+    }
+}
+
+static void process_files_range_parallel(const std::vector<std::string>& files,
+                                         size_t start,
+                                         size_t end,
+                                         int num_threads,
+                                         size_t chunk_size,
+                                         std::vector<AudioStats>& results,
+                                         std::atomic<size_t>& completed,
+                                         std::mutex& progress_mutex,
+                                         size_t print_every,
+                                         bool use_single_pass) {
+    std::atomic<size_t> next_index(start);
 
     auto worker = [&]() {
         while (true) {
-            size_t idx = next_index.fetch_add(1);
-            if (idx >= files.size()) break;
+            size_t chunk_start = next_index.fetch_add(chunk_size);
+            if (chunk_start >= end) break;
+            size_t chunk_end = std::min(chunk_start + chunk_size, end);
 
-            results[idx] = analyze(files[idx]);
+            for (size_t idx = chunk_start; idx < chunk_end; ++idx) {
+                results[idx] = analyze(files[idx], use_single_pass);
+            }
 
-            size_t done = ++completed;
-            if (done % 10 == 0 || done == files.size()) {
+            size_t done = completed.fetch_add(chunk_end - chunk_start) + (chunk_end - chunk_start);
+            if (done % print_every == 0 || done == files.size()) {
                 std::lock_guard<std::mutex> lock(progress_mutex);
                 std::cerr << "\rProcessing: " << done << "/" << files.size() << " files..." << std::flush;
             }
@@ -414,8 +437,49 @@ static void process_files_parallel(const std::vector<std::string>& files,
     for (auto& t : threads) {
         t.join();
     }
+}
 
-    std::cerr << "\rProcessing: " << files.size() << "/" << files.size() << " files... Done!\n";
+static void process_files_parallel(const std::vector<std::string>& files,
+                                   const Config& config,
+                                   std::vector<AudioStats>& results) {
+    int num_threads = config.num_threads;
+    if (num_threads <= 0) {
+        num_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    }
+
+    results.resize(files.size());
+    std::atomic<size_t> completed(0);
+    std::mutex progress_mutex;
+
+    const size_t total = files.size();
+    if (total == 0) {
+        return;
+    }
+
+    bool use_single_pass = total < 64;
+    size_t print_every = (total < 64) ? total : std::max<size_t>(10, total / 10);
+    size_t chunk_size = 4;
+    if (total < 128) {
+        chunk_size = 1;
+    }
+
+    if (num_threads == 1) {
+        process_files_range_serial(files, 0, total, results, &completed, &progress_mutex,
+                                   print_every, use_single_pass);
+        std::cerr << "\rProcessing: " << total << "/" << total << " files... Done!\n";
+        return;
+    }
+
+    if (total < 16) {
+        process_files_range_serial(files, 0, total, results, nullptr, nullptr,
+                                   print_every, use_single_pass);
+        std::cerr << "\rProcessing: " << total << "/" << total << " files... Done!\n";
+        return;
+    }
+
+    process_files_range_parallel(files, 0, total, num_threads, chunk_size,
+                                 results, completed, progress_mutex, print_every, use_single_pass);
+    std::cerr << "\rProcessing: " << total << "/" << total << " files... Done!\n";
 }
 
 // ============================================================================
