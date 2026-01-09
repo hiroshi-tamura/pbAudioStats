@@ -27,7 +27,36 @@ AudioStats analyze(const std::string& filepath, bool use_single_pass) {
     stats.filename_ext = p.filename().string();
     stats.filename = p.stem().string();
 
-    // Load audio
+    bool use_stream = use_single_pass;
+
+    if (use_stream) {
+        auto stream = AudioReader::open_stream(filepath);
+        if (stream) {
+            stats.sample_rate = stream->info.sample_rate;
+            stats.bit_depth = stream->info.bit_depth;
+            stats.channels = stream->info.channels;
+            stats.duration_seconds = (stats.sample_rate > 0 && stream->info.total_frames > 0)
+                ? static_cast<double>(stream->info.total_frames) / static_cast<double>(stats.sample_rate)
+                : 0.0;
+            stats.duration_formatted = format_duration(stats.duration_seconds);
+
+            auto loudness = LoudnessMeter::measure_stream(*stream, 50.0);
+            stats.integrated_loudness = loudness.loudness.integrated;
+            stats.shortterm_max = loudness.loudness.shortterm_max;
+            stats.momentary_max = loudness.loudness.momentary_max;
+            stats.loudness_range = loudness.loudness.range;
+            stats.sample_peak = loudness.loudness.sample_peak;
+
+            stats.true_peak = stats.sample_peak;
+
+            stats.rms_min = loudness.rms_min;
+            stats.rms_max = loudness.rms_max;
+            stats.rms_average = loudness.rms_average;
+            return stats;
+        }
+    }
+
+    // Load audio (fallback or SIMD-friendly path)
     auto audio = AudioReader::load(filepath);
     if (!audio) {
         // Return empty stats with file info only

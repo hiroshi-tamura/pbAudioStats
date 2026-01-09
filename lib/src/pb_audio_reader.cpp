@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 // MP3のみ外部ヘッダー使用（MP3デコードは複雑すぎて自前実装不可）
 // Note: DR_MP3_IMPLEMENTATION is defined via CMakeLists.txt
@@ -84,6 +85,371 @@ static double read_extended_be(const uint8_t* p) {
     return sign ? -value : value;
 }
 
+namespace {
+
+class WavStream final : public AudioStream {
+public:
+    explicit WavStream(const std::string& filepath) : file(filepath, std::ios::binary) {
+        if (!file) {
+            return;
+        }
+
+        uint8_t header[12] = {};
+        file.read(reinterpret_cast<char*>(header), sizeof(header));
+        if (file.gcount() != sizeof(header)) return;
+        if (memcmp(header, "RIFF", 4) != 0) return;
+        if (memcmp(header + 8, "WAVE", 4) != 0) return;
+
+        uint16_t audio_format = 0;
+        uint16_t channels = 0;
+        uint32_t sample_rate = 0;
+        uint16_t bits_per_sample = 0;
+        uint64_t data_offset = 0;
+        uint32_t data_size = 0;
+
+        while (file) {
+            char chunk_id[4] = {};
+            uint8_t size_buf[4] = {};
+            file.read(chunk_id, 4);
+            if (file.gcount() != 4) break;
+            file.read(reinterpret_cast<char*>(size_buf), 4);
+            if (file.gcount() != 4) break;
+
+            uint32_t chunk_size = read_u32_le(size_buf);
+            std::streampos chunk_data_pos = file.tellg();
+
+            if (memcmp(chunk_id, "fmt ", 4) == 0) {
+                if (chunk_size < 16) return;
+                uint8_t fmt[16] = {};
+                file.read(reinterpret_cast<char*>(fmt), sizeof(fmt));
+                if (file.gcount() != sizeof(fmt)) return;
+
+                audio_format = read_u16_le(fmt);
+                channels = read_u16_le(fmt + 2);
+                sample_rate = read_u32_le(fmt + 4);
+                bits_per_sample = read_u16_le(fmt + 14);
+
+                if (audio_format != 1 && audio_format != 3) {
+                    return;
+                }
+
+                if (chunk_size > sizeof(fmt)) {
+                    file.seekg(chunk_data_pos + static_cast<std::streamoff>(chunk_size), std::ios::beg);
+                }
+            } else if (memcmp(chunk_id, "data", 4) == 0) {
+                data_offset = static_cast<uint64_t>(chunk_data_pos);
+                data_size = chunk_size;
+                file.seekg(chunk_data_pos + static_cast<std::streamoff>(chunk_size), std::ios::beg);
+            } else {
+                file.seekg(chunk_data_pos + static_cast<std::streamoff>(chunk_size), std::ios::beg);
+            }
+
+            if (chunk_size & 1) {
+                file.seekg(1, std::ios::cur);
+            }
+
+            if (data_offset && channels && sample_rate && bits_per_sample) {
+                break;
+            }
+        }
+
+        if (!data_offset || channels == 0 || sample_rate == 0 || bits_per_sample == 0) {
+            return;
+        }
+
+        int bytes_per_sample = bits_per_sample / 8;
+        uint64_t total_frames = data_size / (channels * bytes_per_sample);
+
+        info.sample_rate = sample_rate;
+        info.channels = channels;
+        info.bit_depth = bits_per_sample;
+        info.total_frames = total_frames;
+
+        audio_format_ = audio_format;
+        bytes_per_sample_ = bytes_per_sample;
+        bytes_per_frame_ = static_cast<size_t>(channels) * bytes_per_sample;
+        frames_remaining_ = total_frames;
+
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(data_offset), std::ios::beg);
+        valid_ = true;
+    }
+
+    bool valid() const { return valid_; }
+
+    size_t read_frames(float* buffer, size_t max_frames) override {
+        if (!valid_ || frames_remaining_ == 0) return 0;
+
+        size_t frames_to_read = static_cast<size_t>(
+            std::min<uint64_t>(frames_remaining_, static_cast<uint64_t>(max_frames)));
+        size_t bytes_to_read = frames_to_read * bytes_per_frame_;
+        if (bytes_to_read == 0) return 0;
+
+        io_buffer_.resize(bytes_to_read);
+        file.read(reinterpret_cast<char*>(io_buffer_.data()), bytes_to_read);
+        size_t bytes_read = static_cast<size_t>(file.gcount());
+        size_t frames_read = bytes_read / bytes_per_frame_;
+        if (frames_read == 0) return 0;
+
+        for (size_t f = 0; f < frames_read; ++f) {
+            size_t base = f * bytes_per_frame_;
+            for (uint16_t ch = 0; ch < info.channels; ++ch) {
+                const uint8_t* p = io_buffer_.data() + base + (ch * bytes_per_sample_);
+                float sample = 0.0f;
+
+                if (audio_format_ == 3) {
+                    if (info.bit_depth == 32) {
+                        uint32_t v = read_u32_le(p);
+                        memcpy(&sample, &v, sizeof(float));
+                    } else if (info.bit_depth == 64) {
+                        uint64_t v = read_u32_le(p) | ((uint64_t)read_u32_le(p + 4) << 32);
+                        double d;
+                        memcpy(&d, &v, sizeof(double));
+                        sample = static_cast<float>(d);
+                    }
+                } else {
+                    switch (info.bit_depth) {
+                        case 8:
+                            sample = (p[0] - 128) / 128.0f;
+                            break;
+                        case 16:
+                            sample = read_i16_le(p) / 32768.0f;
+                            break;
+                        case 24:
+                            sample = read_i24_le(p) / 8388608.0f;
+                            break;
+                        case 32:
+                            sample = read_i32_le(p) / 2147483648.0f;
+                            break;
+                    }
+                }
+                buffer[f * info.channels + ch] = sample;
+            }
+        }
+
+        frames_remaining_ -= frames_read;
+        return frames_read;
+    }
+
+private:
+    std::ifstream file;
+    bool valid_ = false;
+    uint16_t audio_format_ = 0;
+    int bytes_per_sample_ = 0;
+    size_t bytes_per_frame_ = 0;
+    uint64_t frames_remaining_ = 0;
+    std::vector<uint8_t> io_buffer_;
+};
+
+class AiffStream final : public AudioStream {
+public:
+    explicit AiffStream(const std::string& filepath) : file(filepath, std::ios::binary) {
+        if (!file) {
+            return;
+        }
+
+        uint8_t header[12] = {};
+        file.read(reinterpret_cast<char*>(header), sizeof(header));
+        if (file.gcount() != sizeof(header)) return;
+        if (memcmp(header, "FORM", 4) != 0) return;
+
+        bool is_aifc = memcmp(header + 8, "AIFC", 4) == 0;
+        bool is_aiff = memcmp(header + 8, "AIFF", 4) == 0;
+        if (!is_aiff && !is_aifc) return;
+
+        uint16_t channels = 0;
+        uint32_t num_frames = 0;
+        uint16_t bits_per_sample = 0;
+        double sample_rate = 0.0;
+        uint64_t data_offset = 0;
+        uint32_t data_size = 0;
+        bool is_little_endian = false;
+
+        while (file) {
+            char chunk_id[4] = {};
+            uint8_t size_buf[4] = {};
+            file.read(chunk_id, 4);
+            if (file.gcount() != 4) break;
+            file.read(reinterpret_cast<char*>(size_buf), 4);
+            if (file.gcount() != 4) break;
+
+            uint32_t chunk_size = read_u32_be(size_buf);
+            std::streampos chunk_data_pos = file.tellg();
+
+            if (memcmp(chunk_id, "COMM", 4) == 0) {
+                if (chunk_size < 18) return;
+                uint8_t comm[26] = {};
+                size_t to_read = std::min<size_t>(chunk_size, sizeof(comm));
+                file.read(reinterpret_cast<char*>(comm), to_read);
+                if (file.gcount() != static_cast<std::streamsize>(to_read)) return;
+
+                channels = read_u16_be(comm);
+                num_frames = read_u32_be(comm + 2);
+                bits_per_sample = read_u16_be(comm + 6);
+                sample_rate = read_extended_be(comm + 8);
+
+                if (is_aifc && chunk_size >= 22) {
+                    char comp[5] = {0};
+                    memcpy(comp, comm + 18, 4);
+                    if (strcmp(comp, "sowt") == 0) {
+                        is_little_endian = true;
+                    } else if (strcmp(comp, "NONE") != 0 && strcmp(comp, "none") != 0) {
+                        return;
+                    }
+                }
+
+                if (chunk_size > to_read) {
+                    file.seekg(chunk_data_pos + static_cast<std::streamoff>(chunk_size), std::ios::beg);
+                }
+            } else if (memcmp(chunk_id, "SSND", 4) == 0) {
+                if (chunk_size < 8) return;
+                uint8_t ssnd[8] = {};
+                file.read(reinterpret_cast<char*>(ssnd), sizeof(ssnd));
+                if (file.gcount() != sizeof(ssnd)) return;
+                uint32_t offset = read_u32_be(ssnd);
+                data_offset = static_cast<uint64_t>(chunk_data_pos) + 8 + offset;
+                data_size = chunk_size - 8 - offset;
+                file.seekg(chunk_data_pos + static_cast<std::streamoff>(chunk_size), std::ios::beg);
+            } else {
+                file.seekg(chunk_data_pos + static_cast<std::streamoff>(chunk_size), std::ios::beg);
+            }
+
+            if (chunk_size & 1) {
+                file.seekg(1, std::ios::cur);
+            }
+
+            if (data_offset && channels && sample_rate) {
+                break;
+            }
+        }
+
+        if (!data_offset || channels == 0 || sample_rate == 0) {
+            return;
+        }
+
+        info.sample_rate = static_cast<uint32_t>(sample_rate);
+        info.channels = channels;
+        info.bit_depth = bits_per_sample;
+        info.total_frames = num_frames ? num_frames : (data_size / (channels * (bits_per_sample / 8)));
+
+        bytes_per_sample_ = bits_per_sample / 8;
+        bytes_per_frame_ = static_cast<size_t>(channels) * bytes_per_sample_;
+        frames_remaining_ = info.total_frames;
+        is_little_endian_ = is_little_endian;
+
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(data_offset), std::ios::beg);
+        valid_ = true;
+    }
+
+    bool valid() const { return valid_; }
+
+    size_t read_frames(float* buffer, size_t max_frames) override {
+        if (!valid_ || frames_remaining_ == 0) return 0;
+
+        size_t frames_to_read = static_cast<size_t>(
+            std::min<uint64_t>(frames_remaining_, static_cast<uint64_t>(max_frames)));
+        size_t bytes_to_read = frames_to_read * bytes_per_frame_;
+        if (bytes_to_read == 0) return 0;
+
+        io_buffer_.resize(bytes_to_read);
+        file.read(reinterpret_cast<char*>(io_buffer_.data()), bytes_to_read);
+        size_t bytes_read = static_cast<size_t>(file.gcount());
+        size_t frames_read = bytes_read / bytes_per_frame_;
+        if (frames_read == 0) return 0;
+
+        for (size_t f = 0; f < frames_read; ++f) {
+            size_t base = f * bytes_per_frame_;
+            for (uint16_t ch = 0; ch < info.channels; ++ch) {
+                const uint8_t* p = io_buffer_.data() + base + (ch * bytes_per_sample_);
+                float sample = 0.0f;
+
+                if (is_little_endian_) {
+                    switch (info.bit_depth) {
+                        case 8:
+                            sample = static_cast<int8_t>(p[0]) / 128.0f;
+                            break;
+                        case 16:
+                            sample = static_cast<int16_t>(p[0] | (p[1] << 8)) / 32768.0f;
+                            break;
+                        case 24: {
+                            int32_t v = p[0] | (p[1] << 8) | (p[2] << 16);
+                            if (v & 0x800000) v |= 0xFF000000;
+                            sample = v / 8388608.0f;
+                            break;
+                        }
+                        case 32:
+                            sample = static_cast<int32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)) / 2147483648.0f;
+                            break;
+                    }
+                } else {
+                    switch (info.bit_depth) {
+                        case 8:
+                            sample = static_cast<int8_t>(p[0]) / 128.0f;
+                            break;
+                        case 16:
+                            sample = read_i16_be(p) / 32768.0f;
+                            break;
+                        case 24:
+                            sample = read_i24_be(p) / 8388608.0f;
+                            break;
+                        case 32:
+                            sample = read_i32_be(p) / 2147483648.0f;
+                            break;
+                    }
+                }
+                buffer[f * info.channels + ch] = sample;
+            }
+        }
+
+        frames_remaining_ -= frames_read;
+        return frames_read;
+    }
+
+private:
+    std::ifstream file;
+    bool valid_ = false;
+    bool is_little_endian_ = false;
+    int bytes_per_sample_ = 0;
+    size_t bytes_per_frame_ = 0;
+    uint64_t frames_remaining_ = 0;
+    std::vector<uint8_t> io_buffer_;
+};
+
+class Mp3Stream final : public AudioStream {
+public:
+    explicit Mp3Stream(const std::string& filepath) {
+        if (!drmp3_init_file(&mp3_, filepath.c_str(), nullptr)) {
+            return;
+        }
+        valid_ = true;
+        info.sample_rate = mp3_.sampleRate;
+        info.channels = static_cast<uint16_t>(mp3_.channels);
+        info.bit_depth = 16;
+        info.total_frames = drmp3_get_pcm_frame_count(&mp3_);
+    }
+
+    ~Mp3Stream() override {
+        if (valid_) {
+            drmp3_uninit(&mp3_);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+    size_t read_frames(float* buffer, size_t max_frames) override {
+        if (!valid_) return 0;
+        drmp3_uint64 frames = drmp3_read_pcm_frames_f32(&mp3_, static_cast<drmp3_uint64>(max_frames), buffer);
+        return static_cast<size_t>(frames);
+    }
+
+private:
+    drmp3 mp3_ = {};
+    bool valid_ = false;
+};
+
+} // namespace
+
 // ============================================================================
 // Format Detection
 // ============================================================================
@@ -116,6 +482,30 @@ std::unique_ptr<AudioData> AudioReader::load(const std::string& filepath) {
             return load_aiff(filepath);
         case AudioFormat::MP3:
             return load_mp3(filepath);
+        default:
+            return nullptr;
+    }
+}
+
+std::unique_ptr<AudioStream> AudioReader::open_stream(const std::string& filepath) {
+    AudioFormat format = detect_format(filepath);
+
+    switch (format) {
+        case AudioFormat::WAV: {
+            auto stream = std::make_unique<WavStream>(filepath);
+            if (!static_cast<WavStream*>(stream.get())->valid()) return nullptr;
+            return stream;
+        }
+        case AudioFormat::AIFF: {
+            auto stream = std::make_unique<AiffStream>(filepath);
+            if (!static_cast<AiffStream*>(stream.get())->valid()) return nullptr;
+            return stream;
+        }
+        case AudioFormat::MP3: {
+            auto stream = std::make_unique<Mp3Stream>(filepath);
+            if (!static_cast<Mp3Stream*>(stream.get())->valid()) return nullptr;
+            return stream;
+        }
         default:
             return nullptr;
     }

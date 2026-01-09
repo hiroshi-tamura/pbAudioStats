@@ -887,6 +887,219 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
 }
 
 // ============================================================================
+// Public API: LoudnessMeter::measure_stream
+// ============================================================================
+
+LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream, double window_ms) {
+    ExtendedResult out = {};
+    out.loudness = {
+        SILENCE_THRESHOLD,
+        SILENCE_THRESHOLD,
+        SILENCE_THRESHOLD,
+        0.0,
+        -std::numeric_limits<double>::infinity()
+    };
+    out.rms_min = -96.0;
+    out.rms_max = -96.0;
+    out.rms_average = -96.0;
+
+    const auto info = stream.info;
+    if (info.channels == 0 || info.sample_rate == 0) {
+        return out;
+    }
+
+    const double sample_rate = static_cast<double>(info.sample_rate);
+    const int channels = info.channels;
+
+    const double time_constant = window_ms / 1000.0;
+    const double mult = std::exp(-1.0 / (time_constant * sample_rate));
+    const double one_minus_mult = 1.0 - mult;
+    const uint64_t tc_samples = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
+
+    std::vector<double> avg_sigma_x2(channels, 0.0);
+    std::vector<double> max_sigma_x2(channels, 0.0);
+    std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
+    std::vector<double> sum_sq(channels, 0.0);
+    std::vector<uint64_t> sample_count(channels, 0);
+
+    float sample_peak_linear = 0.0f;
+
+    KWeightingFilter kfilter(sample_rate, channels);
+    BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
+    BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
+    LoudnessHistogram momentary_histogram;
+    LoudnessHistogram shortterm_histogram;
+
+    constexpr double MIN_DURATION_MS = 4000.0;
+    const size_t min_frames = static_cast<size_t>((MIN_DURATION_MS / 1000.0) * sample_rate);
+
+    const size_t frames_per_chunk = 4096;
+    std::vector<float> chunk(frames_per_chunk * channels);
+    std::vector<float> short_buffer;
+    size_t buffered_frames = 0;
+    bool loudness_started = false;
+
+    auto process_loudness_frames = [&](const float* data, size_t frames) {
+        for (size_t frame = 0; frame < frames; ++frame) {
+            const float* frame_samples = data + frame * channels;
+            double weighted_sq = kfilter.process_frame(frame_samples);
+
+            double block_power;
+            if (momentary.add_sample(weighted_sq, block_power)) {
+                momentary_histogram.add_block(block_power);
+            }
+            if (shortterm.add_sample(weighted_sq, block_power)) {
+                shortterm_histogram.add_block(block_power);
+            }
+        }
+    };
+
+    while (true) {
+        size_t frames_read = stream.read_frames(chunk.data(), frames_per_chunk);
+        if (frames_read == 0) {
+            break;
+        }
+
+        float chunk_peak = simd::find_peak_abs(chunk.data(), frames_read * static_cast<size_t>(channels));
+        if (chunk_peak > sample_peak_linear) {
+            sample_peak_linear = chunk_peak;
+        }
+
+        for (size_t frame = 0; frame < frames_read; ++frame) {
+            for (int ch = 0; ch < channels; ++ch) {
+                float s = chunk[frame * channels + ch];
+                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
+                sum_sq[ch] += sample_sq;
+                sample_count[ch]++;
+
+                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+                if (sample_count[ch] >= tc_samples) {
+                    if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
+                        max_sigma_x2[ch] = avg_sigma_x2[ch];
+                    }
+                    if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
+                        min_sigma_x2[ch] = avg_sigma_x2[ch];
+                    }
+                }
+            }
+        }
+
+        if (!loudness_started) {
+            size_t needed = (buffered_frames < min_frames) ? (min_frames - buffered_frames) : 0;
+            size_t to_buffer = std::min(needed, frames_read);
+            if (to_buffer > 0) {
+                size_t old_size = short_buffer.size();
+                short_buffer.resize(old_size + to_buffer * channels);
+                std::memcpy(short_buffer.data() + old_size,
+                            chunk.data(),
+                            to_buffer * channels * sizeof(float));
+                buffered_frames += to_buffer;
+            }
+
+            if (buffered_frames >= min_frames) {
+                process_loudness_frames(short_buffer.data(), buffered_frames);
+                loudness_started = true;
+
+                if (frames_read > to_buffer) {
+                    process_loudness_frames(chunk.data() + (to_buffer * channels), frames_read - to_buffer);
+                }
+            }
+        } else {
+            process_loudness_frames(chunk.data(), frames_read);
+        }
+    }
+
+    if (!loudness_started && buffered_frames > 0) {
+        size_t loops_needed = (min_frames + buffered_frames - 1) / buffered_frames;
+        for (size_t loop = 0; loop < loops_needed; ++loop) {
+            process_loudness_frames(short_buffer.data(), buffered_frames);
+        }
+    }
+
+    out.loudness.integrated = momentary_histogram.get_integrated_loudness();
+    out.loudness.momentary_max = momentary.get_max_loudness();
+    out.loudness.shortterm_max = shortterm.get_max_loudness();
+    out.loudness.range = shortterm_histogram.get_loudness_range();
+
+    if (sample_peak_linear > 0.0f) {
+        out.loudness.sample_peak = 20.0 * std::log10(static_cast<double>(sample_peak_linear));
+    } else {
+        out.loudness.sample_peak = -std::numeric_limits<double>::infinity();
+    }
+
+    if (std::isinf(out.loudness.momentary_max) && momentary_histogram.total_count > 0) {
+        out.loudness.momentary_max = momentary_histogram.get_max_loudness();
+    }
+
+    if (std::isinf(out.loudness.shortterm_max) && shortterm_histogram.total_count > 0) {
+        out.loudness.shortterm_max = shortterm_histogram.get_max_loudness();
+    }
+
+    if (std::isinf(out.loudness.momentary_max)) {
+        out.loudness.momentary_max = out.loudness.integrated;
+    }
+
+    if (std::isinf(out.loudness.shortterm_max)) {
+        out.loudness.shortterm_max = out.loudness.momentary_max;
+    }
+
+    if (out.loudness.range <= 0.0 && shortterm_histogram.total_count < 2) {
+        out.loudness.range = 20.0;
+    }
+
+    for (int ch = 0; ch < channels; ++ch) {
+        if (sample_count[ch] < tc_samples) {
+            double avg_power = sum_sq[ch] / static_cast<double>(sample_count[ch]);
+            max_sigma_x2[ch] = avg_power;
+            min_sigma_x2[ch] = avg_power;
+        }
+    }
+
+    double total_sum_sq = 0.0;
+    uint64_t total_sample_count = 0;
+    for (int ch = 0; ch < channels; ++ch) {
+        total_sum_sq += sum_sq[ch];
+        total_sample_count += sample_count[ch];
+    }
+
+    if (total_sample_count > 0 && total_sum_sq > 0.0) {
+        double avg_rms = std::sqrt(total_sum_sq / static_cast<double>(total_sample_count));
+        out.rms_average = 20.0 * std::log10(avg_rms);
+    }
+
+    double overall_max_sigma_x2 = 0.0;
+    for (int ch = 0; ch < channels; ++ch) {
+        if (max_sigma_x2[ch] > overall_max_sigma_x2) {
+            overall_max_sigma_x2 = max_sigma_x2[ch];
+        }
+    }
+    if (overall_max_sigma_x2 > 0.0) {
+        double max_rms = std::sqrt(overall_max_sigma_x2);
+        out.rms_max = 20.0 * std::log10(max_rms);
+    }
+
+    double overall_min_sigma_x2 = std::numeric_limits<double>::max();
+    for (int ch = 0; ch < channels; ++ch) {
+        if (min_sigma_x2[ch] < overall_min_sigma_x2) {
+            overall_min_sigma_x2 = min_sigma_x2[ch];
+        }
+    }
+    if (overall_min_sigma_x2 > 0.0 && overall_min_sigma_x2 < std::numeric_limits<double>::max()) {
+        double min_rms = std::sqrt(overall_min_sigma_x2);
+        double min_db = 20.0 * std::log10(min_rms);
+        if (std::isinf(min_db)) {
+            out.rms_min = -96.0;
+        } else {
+            out.rms_min = min_db;
+        }
+    } else {
+        out.rms_min = -96.0;
+    }
+
+    return out;
+}
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 

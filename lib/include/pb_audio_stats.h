@@ -35,6 +35,21 @@ struct AudioData {
     }
 };
 
+// Streamed audio info
+struct StreamInfo {
+    uint32_t sample_rate;
+    uint16_t channels;
+    uint16_t bit_depth;
+    uint64_t total_frames;
+};
+
+class AudioStream {
+public:
+    StreamInfo info = {};
+    virtual ~AudioStream() = default;
+    virtual size_t read_frames(float* buffer, size_t max_frames) = 0;
+};
+
 // Measurement results
 struct AudioStats {
     // File information
@@ -71,6 +86,7 @@ class AudioReader {
 public:
     static AudioFormat detect_format(const std::string& filepath);
     static std::unique_ptr<AudioData> load(const std::string& filepath);
+    static std::unique_ptr<AudioStream> open_stream(const std::string& filepath);
 
 private:
     static std::unique_ptr<AudioData> load_wav(const std::string& filepath);
@@ -101,6 +117,7 @@ public:
 
     static Result measure(const AudioData& audio);
     static ExtendedResult measure_with_rms(const AudioData& audio, double window_ms = 50.0);
+    static ExtendedResult measure_stream(AudioStream& stream, double window_ms = 50.0);
 
 private:
     // K-weighting filter coefficients
