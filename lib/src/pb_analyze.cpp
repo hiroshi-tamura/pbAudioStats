@@ -27,7 +27,13 @@ AudioStats analyze(const std::string& filepath, bool use_single_pass) {
     stats.filename_ext = p.filename().string();
     stats.filename = p.stem().string();
 
-    bool use_stream = use_single_pass;
+    uintmax_t file_size = 0;
+    std::error_code file_size_ec;
+    file_size = fs::file_size(p, file_size_ec);
+    const uintmax_t stream_threshold_bytes = 32ull * 1024ull * 1024ull;
+    bool use_stream = use_single_pass &&
+        !file_size_ec &&
+        file_size > stream_threshold_bytes;
 
     if (use_stream) {
         auto stream = AudioReader::open_stream(filepath);

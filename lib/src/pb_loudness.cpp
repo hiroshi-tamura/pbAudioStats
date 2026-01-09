@@ -470,6 +470,54 @@ public:
         return completed;
     }
 
+    // Add a batch of weighted squared samples to current block.
+    void add_samples(const double* weighted_sq, size_t count, LoudnessHistogram& histogram) {
+        size_t ring_used_local = ring_used;
+        size_t ring_offset_local = ring_offset;
+        size_t sample_count_local = sample_count;
+        double max_power_local = max_power;
+        const size_t partition_size = static_cast<size_t>(partition);
+
+        double* ring_data = ring.data();
+
+        for (size_t i = 0; i < count; ++i) {
+            double wsq = weighted_sq[i];
+            if (wsq >= 1.0e-15) {
+                double scaled = wsq * scale;
+                for (size_t r = 0; r < ring_used_local; ++r) {
+                    ring_data[r] += scaled;
+                }
+            }
+
+            if (++sample_count_local >= overlap_size) {
+                size_t next_offset = (ring_offset_local + 1) % partition_size;
+
+                if (ring_used_local == partition_size) {
+                    double block_power = ring_data[next_offset];
+                    if (block_power > silence_gate) {
+                        histogram.add_block(block_power);
+                        if (block_power > max_power_local) {
+                            max_power_local = block_power;
+                        }
+                    }
+                }
+
+                ring_data[next_offset] = 0.0;
+                sample_count_local = 0;
+                ring_offset_local = next_offset;
+
+                if (ring_used_local < partition_size) {
+                    ++ring_used_local;
+                }
+            }
+        }
+
+        ring_used = ring_used_local;
+        ring_offset = ring_offset_local;
+        sample_count = sample_count_local;
+        max_power = max_power_local;
+    }
+
     double get_max_loudness() const {
         return power_to_lufs(max_power);
     }
@@ -517,7 +565,9 @@ public:
         double weighted_sq = 0.0;
 
         for (int ch = 0; ch < channels; ++ch) {
-            if (channel_weights[ch] == 0.0) continue;  // Skip LFE
+            if (channel_weights[ch] == 0.0) {
+                continue;
+            }
 
             double x = static_cast<double>(samples[ch]);
 
@@ -529,6 +579,31 @@ public:
         }
 
         return weighted_sq;
+    }
+
+    // Process interleaved samples and write weighted sum of squares per frame.
+    void process_frames(const float* samples, size_t frames, std::vector<double>& out_weighted_sq) {
+        if (out_weighted_sq.size() < frames) {
+            out_weighted_sq.resize(frames);
+        }
+
+        const float* frame_ptr = samples;
+        for (size_t frame = 0; frame < frames; ++frame) {
+            double weighted_sq = 0.0;
+            for (int ch = 0; ch < channels; ++ch) {
+                double weight = channel_weights[ch];
+                if (weight == 0.0) {
+                    continue;
+                }
+
+                double x = static_cast<double>(frame_ptr[ch]);
+                double y = high_shelf.process(x, shelf_states[ch]);
+                double z = high_pass.process(y, hp_states[ch]);
+                weighted_sq += weight * z * z;
+            }
+            out_weighted_sq[frame] = weighted_sq;
+            frame_ptr += channels;
+        }
     }
 
     void reset() {
@@ -733,14 +808,6 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     const double one_minus_mult = 1.0 - mult;
     const uint64_t tc_samples = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
 
-    std::vector<double> avg_sigma_x2(channels, 0.0);
-    std::vector<double> max_sigma_x2(channels, 0.0);
-    std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
-    std::vector<double> sum_sq(channels, 0.0);
-    std::vector<uint64_t> sample_count(channels, 0);
-
-    float sample_peak_linear = 0.0f;
-
     // Loop short audio to minimum length for accurate BS.1770-4 measurement
     size_t total_frames = audio.total_frames;
     std::vector<float> looped_samples;
@@ -760,35 +827,78 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     // Separate histogram for LRA (uses short-term blocks)
     LoudnessHistogram shortterm_histogram;
 
-    // Process all frames (looped audio for loudness, original for RMS/peak)
-    for (size_t frame = 0; frame < total_frames; ++frame) {
+    float sample_peak_linear = 0.0f;
+
+    std::vector<double> avg_sigma_x2(channels, 0.0);
+    std::vector<double> max_sigma_x2(channels, 0.0);
+    std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
+    std::vector<double> sum_sq(channels, 0.0);
+
+    // Process original frames (RMS + loudness)
+    const size_t gate_start = std::min(original_frames, static_cast<size_t>(tc_samples));
+
+    for (size_t frame = 0; frame < gate_start; ++frame) {
         const float* frame_samples = samples + frame * channels;
+        for (int ch = 0; ch < channels; ++ch) {
+            float s = frame_samples[ch];
+            float abs_s = std::fabs(s);
+            if (abs_s > sample_peak_linear) {
+                sample_peak_linear = abs_s;
+            }
 
-        if (frame < original_frames) {
-            for (int ch = 0; ch < channels; ++ch) {
-                float s = frame_samples[ch];
-                float abs_s = std::fabs(s);
-                if (abs_s > sample_peak_linear) {
-                    sample_peak_linear = abs_s;
-                }
+            double sample_sq = static_cast<double>(s) * static_cast<double>(s);
+            sum_sq[ch] += sample_sq;
+            avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+        }
 
-                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
-                sum_sq[ch] += sample_sq;
-                sample_count[ch]++;
+        double weighted_sq = kfilter.process_frame(frame_samples);
 
-                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+        double block_power;
+        if (momentary.add_sample(weighted_sq, block_power)) {
+            momentary_histogram.add_block(block_power);
+        }
 
-                if (frame >= tc_samples) {
-                    if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
-                        max_sigma_x2[ch] = avg_sigma_x2[ch];
-                    }
-                    if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
-                        min_sigma_x2[ch] = avg_sigma_x2[ch];
-                    }
-                }
+        if (shortterm.add_sample(weighted_sq, block_power)) {
+            shortterm_histogram.add_block(block_power);
+        }
+    }
+
+    for (size_t frame = gate_start; frame < original_frames; ++frame) {
+        const float* frame_samples = samples + frame * channels;
+        for (int ch = 0; ch < channels; ++ch) {
+            float s = frame_samples[ch];
+            float abs_s = std::fabs(s);
+            if (abs_s > sample_peak_linear) {
+                sample_peak_linear = abs_s;
+            }
+
+            double sample_sq = static_cast<double>(s) * static_cast<double>(s);
+            sum_sq[ch] += sample_sq;
+            avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+
+            if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
+                max_sigma_x2[ch] = avg_sigma_x2[ch];
+            }
+            if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
+                min_sigma_x2[ch] = avg_sigma_x2[ch];
             }
         }
 
+        double weighted_sq = kfilter.process_frame(frame_samples);
+
+        double block_power;
+        if (momentary.add_sample(weighted_sq, block_power)) {
+            momentary_histogram.add_block(block_power);
+        }
+
+        if (shortterm.add_sample(weighted_sq, block_power)) {
+            shortterm_histogram.add_block(block_power);
+        }
+    }
+
+    // Process looped frames for loudness only
+    for (size_t frame = original_frames; frame < total_frames; ++frame) {
+        const float* frame_samples = samples + frame * channels;
         double weighted_sq = kfilter.process_frame(frame_samples);
 
         double block_power;
@@ -834,19 +944,20 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     }
 
     // RMS results (SOX behavior)
-    for (int ch = 0; ch < channels; ++ch) {
-        if (sample_count[ch] < tc_samples) {
-            double avg_power = sum_sq[ch] / static_cast<double>(sample_count[ch]);
+    if (original_frames < static_cast<size_t>(tc_samples)) {
+        for (int ch = 0; ch < channels; ++ch) {
+            double avg_power = sum_sq[ch] / static_cast<double>(original_frames);
             max_sigma_x2[ch] = avg_power;
             min_sigma_x2[ch] = avg_power;
         }
     }
 
     double total_sum_sq = 0.0;
-    uint64_t total_sample_count = 0;
+    const uint64_t total_sample_count =
+        static_cast<uint64_t>(original_frames) * static_cast<uint64_t>(channels);
+
     for (int ch = 0; ch < channels; ++ch) {
         total_sum_sq += sum_sq[ch];
-        total_sample_count += sample_count[ch];
     }
 
     if (total_sample_count > 0 && total_sum_sq > 0.0) {
@@ -916,13 +1027,14 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     const double one_minus_mult = 1.0 - mult;
     const uint64_t tc_samples = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
 
+    float sample_peak_linear = 0.0f;
+
     std::vector<double> avg_sigma_x2(channels, 0.0);
     std::vector<double> max_sigma_x2(channels, 0.0);
     std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
     std::vector<double> sum_sq(channels, 0.0);
-    std::vector<uint64_t> sample_count(channels, 0);
 
-    float sample_peak_linear = 0.0f;
+    uint64_t total_frames = 0;
 
     KWeightingFilter kfilter(sample_rate, channels);
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
@@ -965,24 +1077,43 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
             sample_peak_linear = chunk_peak;
         }
 
-        for (size_t frame = 0; frame < frames_read; ++frame) {
+        uint64_t frames_seen = total_frames;
+        size_t pre_frames = 0;
+        if (frames_seen < tc_samples) {
+            uint64_t remaining = tc_samples - frames_seen;
+            pre_frames = static_cast<size_t>(
+                std::min<uint64_t>(static_cast<uint64_t>(frames_read), remaining));
+        }
+
+        const float* frame_samples = chunk.data();
+        for (size_t frame = 0; frame < pre_frames; ++frame) {
             for (int ch = 0; ch < channels; ++ch) {
-                float s = chunk[frame * channels + ch];
+                float s = frame_samples[ch];
                 double sample_sq = static_cast<double>(s) * static_cast<double>(s);
                 sum_sq[ch] += sample_sq;
-                sample_count[ch]++;
-
                 avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
-                if (sample_count[ch] >= tc_samples) {
-                    if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
-                        max_sigma_x2[ch] = avg_sigma_x2[ch];
-                    }
-                    if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
-                        min_sigma_x2[ch] = avg_sigma_x2[ch];
-                    }
+            }
+            frame_samples += channels;
+        }
+
+        for (size_t frame = pre_frames; frame < frames_read; ++frame) {
+            for (int ch = 0; ch < channels; ++ch) {
+                float s = frame_samples[ch];
+                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
+                sum_sq[ch] += sample_sq;
+                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+
+                if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
+                    max_sigma_x2[ch] = avg_sigma_x2[ch];
+                }
+                if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
+                    min_sigma_x2[ch] = avg_sigma_x2[ch];
                 }
             }
+            frame_samples += channels;
         }
+
+        total_frames += frames_read;
 
         if (!loudness_started) {
             size_t needed = (buffered_frames < min_frames) ? (min_frames - buffered_frames) : 0;
@@ -1047,20 +1178,21 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
         out.loudness.range = 20.0;
     }
 
-    for (int ch = 0; ch < channels; ++ch) {
-        if (sample_count[ch] < tc_samples) {
-            double avg_power = sum_sq[ch] / static_cast<double>(sample_count[ch]);
+    if (total_frames < tc_samples && total_frames > 0) {
+        for (int ch = 0; ch < channels; ++ch) {
+            double avg_power = sum_sq[ch] / static_cast<double>(total_frames);
             max_sigma_x2[ch] = avg_power;
             min_sigma_x2[ch] = avg_power;
         }
     }
 
     double total_sum_sq = 0.0;
-    uint64_t total_sample_count = 0;
     for (int ch = 0; ch < channels; ++ch) {
         total_sum_sq += sum_sq[ch];
-        total_sample_count += sample_count[ch];
     }
+
+    const uint64_t total_sample_count =
+        total_frames * static_cast<uint64_t>(channels);
 
     if (total_sample_count > 0 && total_sum_sq > 0.0) {
         double avg_rms = std::sqrt(total_sum_sq / static_cast<double>(total_sample_count));
