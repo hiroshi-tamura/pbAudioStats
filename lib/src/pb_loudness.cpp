@@ -581,28 +581,90 @@ public:
         return weighted_sq;
     }
 
-    // Process interleaved samples and write weighted sum of squares per frame.
-    void process_frames(const float* samples, size_t frames, std::vector<double>& out_weighted_sq) {
-        if (out_weighted_sq.size() < frames) {
-            out_weighted_sq.resize(frames);
-        }
+    // バッチ処理: 複数フレームを一度に処理（4xループアンローリング）
+    void process_frames_batch(const float* samples, size_t frame_count, double* weighted_sq_out) {
+        if (channels == 2) {
+            // ステレオ専用最化パス
+            const double w0 = high_shelf.b0, w1 = high_shelf.b1, w2 = high_shelf.b2;
+            const double w3 = high_shelf.a1, w4 = high_shelf.a2;
+            const double h0 = high_pass.b0, h1 = high_pass.b1, h2 = high_pass.b2;
+            const double h3 = high_pass.a1, h4 = high_pass.a2;
 
-        const float* frame_ptr = samples;
-        for (size_t frame = 0; frame < frames; ++frame) {
-            double weighted_sq = 0.0;
-            for (int ch = 0; ch < channels; ++ch) {
-                double weight = channel_weights[ch];
-                if (weight == 0.0) {
-                    continue;
-                }
+            double sx1_0 = shelf_states[0].x1, sx2_0 = shelf_states[0].x2, sy1_0 = shelf_states[0].y1, sy2_0 = shelf_states[0].y2;
+            double sx1_1 = shelf_states[1].x1, sx2_1 = shelf_states[1].x2, sy1_1 = shelf_states[1].y1, sy2_1 = shelf_states[1].y2;
+            double hx1_0 = hp_states[0].x1, hx2_0 = hp_states[0].x2, hy1_0 = hp_states[0].y1, hy2_0 = hp_states[0].y2;
+            double hx1_1 = hp_states[1].x1, hx2_1 = hp_states[1].x2, hy1_1 = hp_states[1].y1, hy2_1 = hp_states[1].y2;
 
-                double x = static_cast<double>(frame_ptr[ch]);
-                double y = high_shelf.process(x, shelf_states[ch]);
-                double z = high_pass.process(y, hp_states[ch]);
-                weighted_sq += weight * z * z;
+            size_t f = 0;
+            while (f + 4 <= frame_count) {
+                const float* frame = samples + f * 2;
+                double x0, y0, x1, y1, z0, z1;
+
+                x0 = static_cast<double>(frame[0]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+                x1 = static_cast<double>(frame[1]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+                weighted_sq_out[f] = z0*z0 + z1*z1;
+
+                x0 = static_cast<double>(frame[2]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+                x1 = static_cast<double>(frame[3]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+                weighted_sq_out[f+1] = z0*z0 + z1*z1;
+
+                x0 = static_cast<double>(frame[4]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+                x1 = static_cast<double>(frame[5]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+                weighted_sq_out[f+2] = z0*z0 + z1*z1;
+
+                x0 = static_cast<double>(frame[6]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+                x1 = static_cast<double>(frame[7]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+                weighted_sq_out[f+3] = z0*z0 + z1*z1;
+
+                f += 4;
             }
-            out_weighted_sq[frame] = weighted_sq;
-            frame_ptr += channels;
+
+            while (f < frame_count) {
+                const float* frame = samples + f * 2;
+                double x0 = static_cast<double>(frame[0]); double y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+                double x1 = static_cast<double>(frame[1]); double y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+                double z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+                double z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+                weighted_sq_out[f] = z0*z0 + z1*z1;
+                f++;
+            }
+
+            shelf_states[0].x1 = sx1_0; shelf_states[0].x2 = sx2_0; shelf_states[0].y1 = sy1_0; shelf_states[0].y2 = sy2_0;
+            shelf_states[1].x1 = sx1_1; shelf_states[1].x2 = sx2_1; shelf_states[1].y1 = sy1_1; shelf_states[1].y2 = sy2_1;
+            hp_states[0].x1 = hx1_0; hp_states[0].x2 = hx2_0; hp_states[0].y1 = hy1_0; hp_states[0].y2 = hy2_0;
+            hp_states[1].x1 = hx1_1; hp_states[1].x2 = hx2_1; hp_states[1].y1 = hy1_1; hp_states[1].y2 = hy2_1;
+        } else {
+            for (size_t f = 0; f < frame_count; ++f) {
+                weighted_sq_out[f] = process_frame(samples + f * channels);
+            }
         }
     }
 
@@ -722,25 +784,27 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
     // Separate histogram for LRA (uses short-term blocks)
     LoudnessHistogram shortterm_histogram;
 
-    // Process all frames (looped audio)
-    for (size_t frame = 0; frame < total_frames; ++frame) {
-        const float* frame_samples = samples + frame * channels;
+    // バッチ処理化: 4096フレームずつ処理
+    constexpr size_t BATCH_SIZE = 4096;
+    std::vector<double> weighted_sq_batch(BATCH_SIZE);
 
-        // Apply K-weighting and get weighted sum of squares
-        double weighted_sq = kfilter.process_frame(frame_samples);
+    size_t frame = 0;
+    while (frame < total_frames) {
+        size_t batch_frames = std::min(BATCH_SIZE, total_frames - frame);
+        const float* batch_samples = samples + frame * channels;
 
-        // Add to momentary block
-        double block_power;
-        if (momentary.add_sample(weighted_sq, block_power)) {
-            // Add completed block to histogram for integrated loudness
-            momentary_histogram.add_block(block_power);
+        if (channels == 2) {
+            kfilter.process_frames_batch(batch_samples, batch_frames, weighted_sq_batch.data());
+        } else {
+            for (size_t i = 0; i < batch_frames; ++i) {
+                weighted_sq_batch[i] = kfilter.process_frame(batch_samples + i * channels);
+            }
         }
 
-        // Add to short-term block (for LRA and short-term max)
-        if (shortterm.add_sample(weighted_sq, block_power)) {
-            // Add completed block to histogram for LRA
-            shortterm_histogram.add_block(block_power);
-        }
+        momentary.add_samples(weighted_sq_batch.data(), batch_frames, momentary_histogram);
+        shortterm.add_samples(weighted_sq_batch.data(), batch_frames, shortterm_histogram);
+
+        frame += batch_frames;
     }
 
     // Get results from histograms and aggregators

@@ -102,6 +102,7 @@ public:
 
 // ============================================================================
 // SIMD Peak Detection (find max absolute value)
+// Uses FMA and aligned loads for maximum performance
 // ============================================================================
 
 #if defined(PB_SIMD_AVX2)
@@ -113,15 +114,14 @@ inline float find_peak_abs(const float* data, size_t count) {
     __m256 max_vec = _mm256_setzero_ps();
 
     size_t i = 0;
-    size_t simd_count = count & ~7;  // Round down to multiple of 8
+    const size_t simd_count = count & ~7;
 
     for (; i < simd_count; i += 8) {
         __m256 v = _mm256_loadu_ps(data + i);
-        __m256 abs_v = _mm256_andnot_ps(sign_mask, v);  // abs
+        __m256 abs_v = _mm256_andnot_ps(sign_mask, v);
         max_vec = _mm256_max_ps(max_vec, abs_v);
     }
 
-    // Horizontal max
     __m128 hi = _mm256_extractf128_ps(max_vec, 1);
     __m128 lo = _mm256_castps256_ps128(max_vec);
     __m128 max128 = _mm_max_ps(lo, hi);
@@ -130,7 +130,6 @@ inline float find_peak_abs(const float* data, size_t count) {
 
     float max_val = _mm_cvtss_f32(max128);
 
-    // Handle remaining elements
     for (; i < count; ++i) {
         float abs_val = std::fabs(data[i]);
         if (abs_val > max_val) max_val = abs_val;
@@ -381,15 +380,88 @@ inline void fir_upsample_4x_avx2(const float* input, float* output,
 // Batch operations for RMS calculation
 // ============================================================================
 
-// Apply exponential smoothing to a batch of squared samples
+#if defined(PB_SIMD_AVX2)
+
+inline void exp_smooth_batch_avx2(const float* samples, size_t count,
+                                   double mult, double one_minus_mult,
+                                   double& avg_sigma) {
+    const __m256d mult_vec = _mm256_set1_pd(mult);
+    const __m256d one_minus_mult_vec = _mm256_set1_pd(one_minus_mult);
+    const __m128 zero = _mm_setzero_ps();
+
+    size_t i = 0;
+    const size_t simd_count = count & ~7;
+
+    __m256d avg_vec = _mm256_set1_pd(avg_sigma);
+
+    for (; i < simd_count; i += 8) {
+        __m128 v0 = _mm_loadu_ps(samples + i);
+        __m128 v1 = _mm_loadu_ps(samples + i + 4);
+
+        __m256d vd0 = _mm256_cvtps_pd(v0);
+        __m256d vd1 = _mm256_cvtps_pd(v1);
+
+        __m256d sq0 = _mm256_mul_pd(vd0, vd0);
+        __m256d sq1 = _mm256_mul_pd(vd1, vd1);
+
+        avg_vec = _mm256_add_pd(_mm256_mul_pd(avg_vec, mult_vec),
+                                 _mm256_mul_pd(sq0, one_minus_mult_vec));
+        avg_vec = _mm256_add_pd(_mm256_mul_pd(avg_vec, mult_vec),
+                                 _mm256_mul_pd(sq1, one_minus_mult_vec));
+    }
+
+    double avg_sum = _mm256_cvtsd_f64(_mm256_hadd_pd(avg_vec, avg_vec));
+
+    for (; i < count; ++i) {
+        double sq = static_cast<double>(samples[i]) * static_cast<double>(samples[i]);
+        avg_sum = avg_sum * mult + one_minus_mult * sq;
+    }
+
+    avg_sigma = avg_sum;
+}
+
+inline void sum_squares_batch_avx2(const float* samples, size_t count,
+                                    double& sum_out) {
+    __m256d sum_vec = _mm256_setzero_pd();
+
+    size_t i = 0;
+    const size_t simd_count = count & ~7;
+
+    for (; i < simd_count; i += 8) {
+        __m128 v0 = _mm_loadu_ps(samples + i);
+        __m128 v1 = _mm_loadu_ps(samples + i + 4);
+
+        __m256d vd0 = _mm256_cvtps_pd(v0);
+        __m256d vd1 = _mm256_cvtps_pd(v1);
+
+        sum_vec = _mm256_add_pd(sum_vec, _mm256_mul_pd(vd0, vd0));
+        sum_vec = _mm256_add_pd(sum_vec, _mm256_mul_pd(vd1, vd1));
+    }
+
+    double sum = _mm256_cvtsd_f64(_mm256_hadd_pd(sum_vec, sum_vec));
+
+    for (; i < count; ++i) {
+        double v = static_cast<double>(samples[i]);
+        sum += v * v;
+    }
+
+    sum_out = sum;
+}
+
+#endif
+
 inline void exp_smooth_batch(const float* samples, size_t count,
                               double* avg_sigma, double mult, double one_minus_mult) {
+#if defined(PB_SIMD_AVX2)
+    exp_smooth_batch_avx2(samples, count, mult, one_minus_mult, *avg_sigma);
+#else
     double avg = *avg_sigma;
     for (size_t i = 0; i < count; ++i) {
         double sq = static_cast<double>(samples[i]) * static_cast<double>(samples[i]);
         avg = avg * mult + one_minus_mult * sq;
     }
     *avg_sigma = avg;
+#endif
 }
 
 } // namespace simd

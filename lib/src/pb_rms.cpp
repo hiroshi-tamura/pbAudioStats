@@ -67,26 +67,68 @@ RMSMeter::Result RMSMeter::measure(const AudioData& audio, double window_ms) {
     std::vector<uint64_t> sample_count(channels, 0);
 
     // Process each frame
-    for (uint64_t frame = 0; frame < total_frames; frame++) {
-        for (uint32_t ch = 0; ch < channels; ch++) {
-            uint64_t idx = frame * channels + ch;
-            double sample = static_cast<double>(audio.samples[idx]);
-            double sample_sq = sample * sample;
+    // 最適化: ステレオの場合はバッチ処理化してSIMDを活用
+    if (channels == 2 && total_frames > 0) {
+        constexpr size_t BATCH_SIZE = 4096;
+        std::vector<float> float_batch_0(BATCH_SIZE);
+        std::vector<float> float_batch_1(BATCH_SIZE);
 
-            // Accumulate for overall RMS
-            sum_sq[ch] += sample_sq;
-            sample_count[ch]++;
+        uint64_t frame = 0;
+        while (frame < total_frames) {
+            size_t batch_frames = std::min(BATCH_SIZE, static_cast<size_t>(total_frames - frame));
 
-            // Exponential moving average update
-            avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+            for (size_t i = 0; i < batch_frames; ++i) {
+                uint64_t idx = (frame + i) * 2;
+                float s0 = audio.samples[idx];
+                float s1 = audio.samples[idx + 1];
+                float_batch_0[i] = s0;
+                float_batch_1[i] = s1;
 
-            // Track min/max only after settling period
+                double sq0 = static_cast<double>(s0) * static_cast<double>(s0);
+                double sq1 = static_cast<double>(s1) * static_cast<double>(s1);
+                sum_sq[0] += sq0;
+                sum_sq[1] += sq1;
+            }
+
+            // バッチ処理で指数移動平均を更新
+            simd::exp_smooth_batch(float_batch_0.data(), batch_frames, &avg_sigma_x2[0], mult, one_minus_mult);
+            simd::exp_smooth_batch(float_batch_1.data(), batch_frames, &avg_sigma_x2[1], mult, one_minus_mult);
+
+            // max/minトラッキング
             if (frame >= tc_samples) {
-                if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
-                    max_sigma_x2[ch] = avg_sigma_x2[ch];
-                }
-                if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
-                    min_sigma_x2[ch] = avg_sigma_x2[ch];
+                if (avg_sigma_x2[0] > max_sigma_x2[0]) max_sigma_x2[0] = avg_sigma_x2[0];
+                if (avg_sigma_x2[0] < min_sigma_x2[0]) min_sigma_x2[0] = avg_sigma_x2[0];
+                if (avg_sigma_x2[1] > max_sigma_x2[1]) max_sigma_x2[1] = avg_sigma_x2[1];
+                if (avg_sigma_x2[1] < min_sigma_x2[1]) min_sigma_x2[1] = avg_sigma_x2[1];
+            }
+
+            sample_count[0] += batch_frames;
+            sample_count[1] += batch_frames;
+            frame += batch_frames;
+        }
+    } else {
+        // 汎用チャンネル数処理
+        for (uint64_t frame = 0; frame < total_frames; frame++) {
+            for (uint32_t ch = 0; ch < channels; ch++) {
+                uint64_t idx = frame * channels + ch;
+                double sample = static_cast<double>(audio.samples[idx]);
+                double sample_sq = sample * sample;
+
+                // Accumulate for overall RMS
+                sum_sq[ch] += sample_sq;
+                sample_count[ch]++;
+
+                // Exponential moving average update
+                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+
+                // Track min/max only after settling period
+                if (frame >= tc_samples) {
+                    if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
+                        max_sigma_x2[ch] = avg_sigma_x2[ch];
+                    }
+                    if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
+                        min_sigma_x2[ch] = avg_sigma_x2[ch];
+                    }
                 }
             }
         }
