@@ -498,11 +498,8 @@ static int process_normalize(const Config& config) {
         // Single file normalization
         std::string output = config.output_path;
         if (output.empty()) {
-            // Generate output filename
-            fs::path p(files[0]);
-            std::string stem = p.stem().string();
-            std::string ext = p.extension().string();
-            output = p.parent_path().string() + "/" + stem + "_normalized" + ext;
+            // Overwrite the original file
+            output = files[0];
         }
 
         std::cout << "Normalizing: " << files[0] << "\n";
@@ -520,7 +517,8 @@ static int process_normalize(const Config& config) {
         // Multiple file normalization
         std::string output_dir = config.output_path;
         if (output_dir.empty()) {
-            output_dir = fs::path(config.input_path).string() + "_normalized";
+            // Overwrite original files in place
+            output_dir = fs::path(config.input_path).string();
         }
 
         if (!fs::exists(output_dir)) {
