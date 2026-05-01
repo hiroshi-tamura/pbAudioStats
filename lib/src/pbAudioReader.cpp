@@ -6,6 +6,7 @@
  */
 
 #include "pbAudioStats.h"
+#include "pbSimd.h"
 #include <fstream>
 #include <cstring>
 #include <cmath>
@@ -185,45 +186,38 @@ public:
         size_t bytes_to_read = frames_to_read * bytes_per_frame_;
         if (bytes_to_read == 0) return 0;
 
-        io_buffer_.resize(bytes_to_read);
+        if (io_buffer_.size() < bytes_to_read) io_buffer_.resize(bytes_to_read);
         file.read(reinterpret_cast<char*>(io_buffer_.data()), bytes_to_read);
         size_t bytes_read = static_cast<size_t>(file.gcount());
         size_t frames_read = bytes_read / bytes_per_frame_;
         if (frames_read == 0) return 0;
 
-        for (size_t f = 0; f < frames_read; ++f) {
-            size_t base = f * bytes_per_frame_;
-            for (uint16_t ch = 0; ch < info.channels; ++ch) {
-                const uint8_t* p = io_buffer_.data() + base + (ch * bytes_per_sample_);
-                float sample = 0.0f;
+        const size_t total_samples = frames_read * info.channels;
+        const uint8_t* src = io_buffer_.data();
 
-                if (audio_format_ == 3) {
-                    if (info.bit_depth == 32) {
-                        uint32_t v = read_u32_le(p);
-                        memcpy(&sample, &v, sizeof(float));
-                    } else if (info.bit_depth == 64) {
-                        uint64_t v = read_u32_le(p) | ((uint64_t)read_u32_le(p + 4) << 32);
-                        double d;
-                        memcpy(&d, &v, sizeof(double));
-                        sample = static_cast<float>(d);
-                    }
-                } else {
-                    switch (info.bit_depth) {
-                        case 8:
-                            sample = (p[0] - 128) / 128.0f;
-                            break;
-                        case 16:
-                            sample = read_i16_le(p) / 32768.0f;
-                            break;
-                        case 24:
-                            sample = read_i24_le(p) / 8388608.0f;
-                            break;
-                        case 32:
-                            sample = read_i32_le(p) / 2147483648.0f;
-                            break;
-                    }
+        if (audio_format_ == 3) {
+            if (info.bit_depth == 32) {
+                std::memcpy(buffer, src, total_samples * sizeof(float));
+            } else if (info.bit_depth == 64) {
+                const double* dsrc = reinterpret_cast<const double*>(src);
+                for (size_t i = 0; i < total_samples; ++i) {
+                    buffer[i] = static_cast<float>(dsrc[i]);
                 }
-                buffer[f * info.channels + ch] = sample;
+            }
+        } else {
+            switch (info.bit_depth) {
+                case 8:
+                    simd::convert_u8_to_float(src, buffer, total_samples);
+                    break;
+                case 16:
+                    simd::convert_i16_le_to_float(src, buffer, total_samples);
+                    break;
+                case 24:
+                    simd::convert_i24_le_to_float(src, buffer, total_samples);
+                    break;
+                case 32:
+                    simd::convert_i32_le_to_float(src, buffer, total_samples);
+                    break;
             }
         }
 
@@ -352,54 +346,31 @@ public:
         size_t bytes_to_read = frames_to_read * bytes_per_frame_;
         if (bytes_to_read == 0) return 0;
 
-        io_buffer_.resize(bytes_to_read);
+        if (io_buffer_.size() < bytes_to_read) io_buffer_.resize(bytes_to_read);
         file.read(reinterpret_cast<char*>(io_buffer_.data()), bytes_to_read);
         size_t bytes_read = static_cast<size_t>(file.gcount());
         size_t frames_read = bytes_read / bytes_per_frame_;
         if (frames_read == 0) return 0;
 
-        for (size_t f = 0; f < frames_read; ++f) {
-            size_t base = f * bytes_per_frame_;
-            for (uint16_t ch = 0; ch < info.channels; ++ch) {
-                const uint8_t* p = io_buffer_.data() + base + (ch * bytes_per_sample_);
-                float sample = 0.0f;
+        const size_t total_samples = frames_read * info.channels;
+        const uint8_t* src = io_buffer_.data();
 
-                if (is_little_endian_) {
-                    switch (info.bit_depth) {
-                        case 8:
-                            sample = static_cast<int8_t>(p[0]) / 128.0f;
-                            break;
-                        case 16:
-                            sample = static_cast<int16_t>(p[0] | (p[1] << 8)) / 32768.0f;
-                            break;
-                        case 24: {
-                            int32_t v = p[0] | (p[1] << 8) | (p[2] << 16);
-                            if (v & 0x800000) v |= 0xFF000000;
-                            sample = v / 8388608.0f;
-                            break;
-                        }
-                        case 32:
-                            sample = static_cast<int32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)) / 2147483648.0f;
-                            break;
-                    }
-                } else {
-                    switch (info.bit_depth) {
-                        case 8:
-                            sample = static_cast<int8_t>(p[0]) / 128.0f;
-                            break;
-                        case 16:
-                            sample = read_i16_be(p) / 32768.0f;
-                            break;
-                        case 24:
-                            sample = read_i24_be(p) / 8388608.0f;
-                            break;
-                        case 32:
-                            sample = read_i32_be(p) / 2147483648.0f;
-                            break;
-                    }
-                }
-                buffer[f * info.channels + ch] = sample;
-            }
+        switch (info.bit_depth) {
+            case 8:
+                simd::convert_s8_to_float(src, buffer, total_samples);
+                break;
+            case 16:
+                if (is_little_endian_) simd::convert_i16_le_to_float(src, buffer, total_samples);
+                else                   simd::convert_i16_be_to_float(src, buffer, total_samples);
+                break;
+            case 24:
+                if (is_little_endian_) simd::convert_i24_le_to_float(src, buffer, total_samples);
+                else                   simd::convert_i24_be_to_float(src, buffer, total_samples);
+                break;
+            case 32:
+                if (is_little_endian_) simd::convert_i32_le_to_float(src, buffer, total_samples);
+                else                   simd::convert_i32_be_to_float(src, buffer, total_samples);
+                break;
         }
 
         frames_remaining_ -= frames_read;
@@ -512,238 +483,72 @@ std::unique_ptr<AudioStream> AudioReader::open_stream(const std::string& filepat
 }
 
 // ============================================================================
-// WAV Loader (native implementation)
+// WAV Loader (streaming-based to avoid a duplicate file-sized buffer)
 // ============================================================================
 
 std::unique_ptr<AudioData> AudioReader::load_wav(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file) return nullptr;
-
-    file.seekg(0, std::ios::end);
-    size_t file_size = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    if (file_size < 44) return nullptr;  // Minimum WAV header size
-
-    std::vector<uint8_t> buffer(file_size);
-    file.read(reinterpret_cast<char*>(buffer.data()), file_size);
-
-    // Check RIFF header
-    if (memcmp(buffer.data(), "RIFF", 4) != 0) return nullptr;
-    if (memcmp(buffer.data() + 8, "WAVE", 4) != 0) return nullptr;
-
-    // Parse chunks
-    uint16_t audio_format = 0;
-    uint16_t channels = 0;
-    uint32_t sample_rate = 0;
-    uint16_t bits_per_sample = 0;
-    const uint8_t* data_ptr = nullptr;
-    uint32_t data_size = 0;
-
-    size_t pos = 12;  // Skip RIFF header
-    while (pos + 8 <= file_size) {
-        const char* chunk_id = reinterpret_cast<const char*>(buffer.data() + pos);
-        uint32_t chunk_size = read_u32_le(buffer.data() + pos + 4);
-
-        if (memcmp(chunk_id, "fmt ", 4) == 0) {
-            // Format chunk
-            if (chunk_size < 16) return nullptr;
-            const uint8_t* fmt = buffer.data() + pos + 8;
-
-            audio_format = read_u16_le(fmt);
-            channels = read_u16_le(fmt + 2);
-            sample_rate = read_u32_le(fmt + 4);
-            // bytes_per_sec at fmt + 8 (skip)
-            // block_align at fmt + 12 (skip)
-            bits_per_sample = read_u16_le(fmt + 14);
-
-            // Support PCM (1) and IEEE float (3)
-            if (audio_format != 1 && audio_format != 3) {
-                return nullptr;  // Compressed formats not supported
-            }
-        } else if (memcmp(chunk_id, "data", 4) == 0) {
-            // Data chunk
-            data_ptr = buffer.data() + pos + 8;
-            data_size = chunk_size;
-        }
-
-        // Move to next chunk (chunks are word-aligned)
-        pos += 8 + chunk_size;
-        if (chunk_size & 1) pos++;
-    }
-
-    if (!data_ptr || channels == 0 || sample_rate == 0 || bits_per_sample == 0) {
-        return nullptr;
-    }
-
-    int bytes_per_sample = bits_per_sample / 8;
-    uint64_t total_frames = data_size / (channels * bytes_per_sample);
+    auto stream = std::make_unique<WavStream>(filepath);
+    if (!stream->valid()) return nullptr;
 
     auto audio = std::make_unique<AudioData>();
-    audio->sample_rate = sample_rate;
-    audio->channels = channels;
-    audio->bit_depth = bits_per_sample;
-    audio->total_frames = total_frames;
-    audio->samples.resize(total_frames * channels);
-
-    // Convert samples to float
-    for (uint64_t i = 0; i < total_frames * channels; i++) {
-        const uint8_t* p = data_ptr + i * bytes_per_sample;
-        float sample = 0.0f;
-
-        if (audio_format == 3) {
-            // IEEE float
-            if (bits_per_sample == 32) {
-                uint32_t v = read_u32_le(p);
-                memcpy(&sample, &v, sizeof(float));
-            } else if (bits_per_sample == 64) {
-                // 64-bit float - read and convert to 32-bit float
-                uint64_t v = read_u32_le(p) | ((uint64_t)read_u32_le(p + 4) << 32);
-                double d;
-                memcpy(&d, &v, sizeof(double));
-                sample = (float)d;
-            }
-        } else {
-            // PCM integer
-            switch (bits_per_sample) {
-                case 8:
-                    // 8-bit WAV is unsigned
-                    sample = (p[0] - 128) / 128.0f;
-                    break;
-                case 16:
-                    sample = read_i16_le(p) / 32768.0f;
-                    break;
-                case 24:
-                    sample = read_i24_le(p) / 8388608.0f;
-                    break;
-                case 32:
-                    sample = read_i32_le(p) / 2147483648.0f;
-                    break;
-            }
-        }
-        audio->samples[i] = sample;
+    audio->sample_rate = stream->info.sample_rate;
+    audio->channels = stream->info.channels;
+    audio->bit_depth = stream->info.bit_depth;
+    audio->total_frames = stream->info.total_frames;
+    if (audio->channels == 0 || audio->total_frames == 0) {
+        return audio;
     }
+    audio->samples.resize(audio->total_frames * audio->channels);
 
+    constexpr size_t CHUNK_FRAMES = 65536;
+    uint64_t total_read = 0;
+    while (total_read < audio->total_frames) {
+        size_t to_read = static_cast<size_t>(
+            std::min<uint64_t>(CHUNK_FRAMES, audio->total_frames - total_read));
+        size_t got = stream->read_frames(
+            audio->samples.data() + total_read * audio->channels, to_read);
+        if (got == 0) break;
+        total_read += got;
+    }
+    if (total_read < audio->total_frames) {
+        audio->total_frames = total_read;
+        audio->samples.resize(total_read * audio->channels);
+    }
     return audio;
 }
 
 // ============================================================================
-// AIFF Loader (native implementation)
+// AIFF Loader (streaming-based to avoid a duplicate file-sized buffer)
 // ============================================================================
 
 std::unique_ptr<AudioData> AudioReader::load_aiff(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file) return nullptr;
-
-    file.seekg(0, std::ios::end);
-    size_t file_size = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> buffer(file_size);
-    file.read(reinterpret_cast<char*>(buffer.data()), file_size);
-
-    if (file_size < 12) return nullptr;
-
-    // Check FORM header
-    if (memcmp(buffer.data(), "FORM", 4) != 0) return nullptr;
-
-    bool is_aifc = memcmp(buffer.data() + 8, "AIFC", 4) == 0;
-    bool is_aiff = memcmp(buffer.data() + 8, "AIFF", 4) == 0;
-    if (!is_aiff && !is_aifc) return nullptr;
-
-    uint16_t channels = 0;
-    uint32_t num_frames = 0;
-    uint16_t bits_per_sample = 0;
-    double sample_rate = 0;
-    const uint8_t* data_ptr = nullptr;
-    uint32_t data_size = 0;
-    bool is_little_endian = false;
-
-    size_t pos = 12;
-    while (pos + 8 <= file_size) {
-        const char* chunk_id = reinterpret_cast<const char*>(buffer.data() + pos);
-        uint32_t chunk_size = read_u32_be(buffer.data() + pos + 4);
-
-        if (memcmp(chunk_id, "COMM", 4) == 0) {
-            const uint8_t* comm = buffer.data() + pos + 8;
-            channels = read_u16_be(comm);
-            num_frames = read_u32_be(comm + 2);
-            bits_per_sample = read_u16_be(comm + 6);
-            sample_rate = read_extended_be(comm + 8);
-
-            if (is_aifc && chunk_size >= 22) {
-                char comp[5] = {0};
-                memcpy(comp, comm + 18, 4);
-                if (strcmp(comp, "sowt") == 0) {
-                    is_little_endian = true;  // Little endian PCM
-                } else if (strcmp(comp, "NONE") != 0 && strcmp(comp, "none") != 0) {
-                    return nullptr;  // Compressed, not supported
-                }
-            }
-        } else if (memcmp(chunk_id, "SSND", 4) == 0) {
-            uint32_t offset = read_u32_be(buffer.data() + pos + 8);
-            data_ptr = buffer.data() + pos + 16 + offset;
-            data_size = chunk_size - 8 - offset;
-        }
-
-        pos += 8 + chunk_size;
-        if (chunk_size & 1) pos++;
-    }
-
-    if (!data_ptr || channels == 0 || sample_rate == 0) return nullptr;
+    auto stream = std::make_unique<AiffStream>(filepath);
+    if (!stream->valid()) return nullptr;
 
     auto audio = std::make_unique<AudioData>();
-    audio->sample_rate = (uint32_t)sample_rate;
-    audio->channels = channels;
-    audio->bit_depth = bits_per_sample;
-    audio->total_frames = num_frames;
-    audio->samples.resize(num_frames * channels);
-
-    int bytes_per_sample = bits_per_sample / 8;
-
-    for (uint64_t i = 0; i < num_frames * channels; i++) {
-        float sample = 0.0f;
-        const uint8_t* p = data_ptr + i * bytes_per_sample;
-
-        if (is_little_endian) {
-            // Little endian (sowt)
-            switch (bits_per_sample) {
-                case 8:
-                    sample = ((int8_t)p[0]) / 128.0f;
-                    break;
-                case 16:
-                    sample = (int16_t)(p[0] | (p[1] << 8)) / 32768.0f;
-                    break;
-                case 24: {
-                    int32_t v = p[0] | (p[1] << 8) | (p[2] << 16);
-                    if (v & 0x800000) v |= 0xFF000000;
-                    sample = v / 8388608.0f;
-                    break;
-                }
-                case 32:
-                    sample = (int32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)) / 2147483648.0f;
-                    break;
-            }
-        } else {
-            // Big endian (standard AIFF)
-            switch (bits_per_sample) {
-                case 8:
-                    sample = ((int8_t)p[0]) / 128.0f;
-                    break;
-                case 16:
-                    sample = read_i16_be(p) / 32768.0f;
-                    break;
-                case 24:
-                    sample = read_i24_be(p) / 8388608.0f;
-                    break;
-                case 32:
-                    sample = read_i32_be(p) / 2147483648.0f;
-                    break;
-            }
-        }
-        audio->samples[i] = sample;
+    audio->sample_rate = stream->info.sample_rate;
+    audio->channels = stream->info.channels;
+    audio->bit_depth = stream->info.bit_depth;
+    audio->total_frames = stream->info.total_frames;
+    if (audio->channels == 0 || audio->total_frames == 0) {
+        return audio;
     }
+    audio->samples.resize(audio->total_frames * audio->channels);
 
+    constexpr size_t CHUNK_FRAMES = 65536;
+    uint64_t total_read = 0;
+    while (total_read < audio->total_frames) {
+        size_t to_read = static_cast<size_t>(
+            std::min<uint64_t>(CHUNK_FRAMES, audio->total_frames - total_read));
+        size_t got = stream->read_frames(
+            audio->samples.data() + total_read * audio->channels, to_read);
+        if (got == 0) break;
+        total_read += got;
+    }
+    if (total_read < audio->total_frames) {
+        audio->total_frames = total_read;
+        audio->samples.resize(total_read * audio->channels);
+    }
     return audio;
 }
 

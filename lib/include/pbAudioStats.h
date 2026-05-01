@@ -52,6 +52,9 @@ public:
 
 // Measurement results
 struct AudioStats {
+    // True when load and analysis succeeded
+    bool valid = false;
+
     // File information
     std::string filename;            // Without extension
     std::string filename_ext;        // With extension
@@ -197,6 +200,9 @@ public:
 // Analyze single file
 AudioStats analyze(const std::string& filepath);
 AudioStats analyze(const std::string& filepath, bool use_single_pass);
+
+// Analyze already-loaded audio (no disk re-read)
+AudioStats analyze(const AudioData& audio, const std::string& source_path);
 
 // Utility functions
 std::string format_duration(double seconds);

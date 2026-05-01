@@ -60,9 +60,11 @@ static inline double lufs_to_power(double lufs) {
     return std::pow(10.0, 0.1 * (0.691 + lufs));
 }
 
-// Denormalize small values to prevent denormal performance issues
+// Flush small biquad outputs to zero to avoid denormal slowdowns.
+// Threshold ~1e-30 sits well below any audible level (~-300 dB) so it does not
+// affect measurement of low-level signals.
 static inline double denormalize(double x) {
-    return (std::fabs(x) < 1.0e-15) ? 0.0 : x;
+    return (std::fabs(x) < 1.0e-30) ? 0.0 : x;
 }
 
 // ============================================================================
@@ -194,14 +196,17 @@ static double get_channel_weight(int channel_index, int total_channels) {
         return 1.0;  // Stereo or mono
     }
 
+    // BS.1770-4: surrounds get +1.5 dB = 10^0.15 ≈ 1.41253754...
+    static const double SURROUND_WEIGHT = std::pow(10.0, 0.15);
+
     // 5.1 layout
     switch (channel_index) {
-        case 0: return 1.0;   // Left
-        case 1: return 1.0;   // Right
-        case 2: return 1.0;   // Center
-        case 3: return 0.0;   // LFE (excluded)
-        case 4: return 1.41;  // Left Surround
-        case 5: return 1.41;  // Right Surround
+        case 0: return 1.0;              // Left
+        case 1: return 1.0;              // Right
+        case 2: return 1.0;              // Center
+        case 3: return 0.0;              // LFE (excluded)
+        case 4: return SURROUND_WEIGHT;  // Left Surround
+        case 5: return SURROUND_WEIGHT;  // Right Surround
         default: return 1.0;
     }
 }
@@ -212,173 +217,123 @@ static double get_channel_weight(int channel_index, int total_channels) {
 
 class LoudnessHistogram {
 public:
-    struct Bin {
-        double db;          // dB value of this bin
-        double power_lo;    // Lower power bound
-        double power_hi;    // Upper power bound
-        uint64_t count;     // Number of blocks in this bin
-    };
+    // Per-bin block count (compact: ~60KB total, fits in L2)
+    std::vector<uint64_t> count;
 
-    std::vector<Bin> bins;
-
-    // First pass statistics (for relative gate calculation)
-    double cumulative_power = 0.0;
+    // Sum of block powers, computed with Neumaier compensated summation
+    // for stability over very long signals.
+    double sum_power = 0.0;
+    double sum_compensation = 0.0;
     uint64_t total_count = 0;
-
-    // Maximum block power
     double max_power = 0.0;
 
-    LoudnessHistogram() {
-        bins.resize(HIST_NBINS);
-        double step = 1.0 / HIST_GRAIN;
+    LoudnessHistogram() : count(HIST_NBINS, 0) {}
 
-        for (int i = 0; i < HIST_NBINS; ++i) {
-            double db = step * i + HIST_MIN_DB;
-            double power = lufs_to_power(db);
-
-            bins[i].db = db;
-            bins[i].power_lo = power;
-            bins[i].power_hi = (i < HIST_NBINS - 1) ? lufs_to_power(db + step) :
-                               std::numeric_limits<double>::infinity();
-            bins[i].count = 0;
-        }
+    static inline int power_to_bin(double power) {
+        if (power <= 0.0) return -1;
+        double db = -0.691 + 10.0 * std::log10(power);
+        if (db < HIST_MIN_DB) return -1;
+        if (db >= HIST_MAX_DB) return HIST_NBINS - 1;
+        return static_cast<int>((db - HIST_MIN_DB) * HIST_GRAIN);
     }
 
-    // Add a block's mean square power to histogram
     void add_block(double power) {
-        // Update maximum
-        if (power > max_power) {
-            max_power = power;
+        if (power > max_power) max_power = power;
+        int bin = power_to_bin(power);
+        if (bin < 0) return;
+        ++count[bin];
+        ++total_count;
+
+        // Neumaier compensated summation
+        double t = sum_power + power;
+        if (std::fabs(sum_power) >= std::fabs(power)) {
+            sum_compensation += (sum_power - t) + power;
+        } else {
+            sum_compensation += (power - t) + sum_power;
+        }
+        sum_power = t;
+    }
+
+    double ungated_sum() const { return sum_power + sum_compensation; }
+
+    double get_ungated_mean() const {
+        if (total_count == 0) return SILENCE_THRESHOLD;
+        return power_to_lufs(ungated_sum() / static_cast<double>(total_count));
+    }
+
+    // Integrated loudness with relative gate at -10 LU below ungated mean
+    // Uses bin-center power to avoid the systematic negative bias of using
+    // the lower bin edge.
+    double get_integrated_loudness() const {
+        if (total_count == 0) return SILENCE_THRESHOLD;
+
+        double mean_power = ungated_sum() / static_cast<double>(total_count);
+        double gate_power = mean_power * std::pow(10.0, 0.1 * RELATIVE_GATE);
+
+        const double step = 1.0 / HIST_GRAIN;
+        double sum = 0.0;
+        uint64_t cnt = 0;
+
+        for (int i = 0; i < HIST_NBINS; ++i) {
+            if (count[i] == 0) continue;
+            double bin_power_lo = lufs_to_power(HIST_MIN_DB + step * i);
+            if (bin_power_lo <= gate_power) continue;
+            double bin_power_mid = lufs_to_power(HIST_MIN_DB + step * (i + 0.5));
+            sum += static_cast<double>(count[i]) * bin_power_mid;
+            cnt += count[i];
         }
 
-        // Binary search for correct bin
-        int lo = 0, hi = HIST_NBINS - 1;
-        int found = -1;
+        if (cnt == 0) return SILENCE_THRESHOLD;
+        return power_to_lufs(sum / static_cast<double>(cnt));
+    }
 
-        while (lo <= hi) {
-            int mid = (lo + hi) / 2;
-            if (power < bins[mid].power_lo) {
-                hi = mid - 1;
-            } else if (power >= bins[mid].power_hi) {
-                lo = mid + 1;
-            } else {
-                found = mid;
+    // Loudness Range (EBU Tech 3342): -20 LU relative gate, 10-95 percentile
+    // (nearest-rank, ceil-based).
+    double get_loudness_range() const {
+        if (total_count < 2) return 0.0;
+
+        double mean_power = ungated_sum() / static_cast<double>(total_count);
+        double gate_power = mean_power * std::pow(10.0, 0.1 * (-20.0));
+
+        const double step = 1.0 / HIST_GRAIN;
+        uint64_t gated = 0;
+        for (int i = 0; i < HIST_NBINS; ++i) {
+            if (count[i] == 0) continue;
+            double bin_power_lo = lufs_to_power(HIST_MIN_DB + step * i);
+            if (bin_power_lo > gate_power) gated += count[i];
+        }
+        if (gated < 2) return 0.0;
+
+        uint64_t lower_rank = static_cast<uint64_t>(
+            std::ceil(static_cast<double>(gated) * LRA_LOWER_PERCENTILE));
+        uint64_t upper_rank = static_cast<uint64_t>(
+            std::ceil(static_cast<double>(gated) * LRA_UPPER_PERCENTILE));
+        if (lower_rank == 0) lower_rank = 1;
+        if (upper_rank == 0) upper_rank = 1;
+
+        uint64_t cum = 0;
+        double low_db = std::nan("");
+        double high_db = std::nan("");
+        for (int i = 0; i < HIST_NBINS; ++i) {
+            if (count[i] == 0) continue;
+            double bin_power_lo = lufs_to_power(HIST_MIN_DB + step * i);
+            if (bin_power_lo <= gate_power) continue;
+            cum += count[i];
+            double bin_db_mid = HIST_MIN_DB + step * (static_cast<double>(i) + 0.5);
+            if (std::isnan(low_db) && cum >= lower_rank) {
+                low_db = bin_db_mid;
+            }
+            if (cum >= upper_rank) {
+                high_db = bin_db_mid;
                 break;
             }
         }
 
-        if (found >= 0) {
-            bins[found].count++;
-
-            // Cumulative moving average for first pass
-            ++total_count;
-            cumulative_power += (power - cumulative_power) / static_cast<double>(total_count);
-        }
+        if (std::isnan(low_db) || std::isnan(high_db)) return 0.0;
+        return high_db - low_db;
     }
 
-    // Get mean loudness above absolute threshold (first pass)
-    double get_ungated_mean() const {
-        if (total_count == 0) return SILENCE_THRESHOLD;
-        return power_to_lufs(cumulative_power);
-    }
-
-    // Get integrated loudness with relative gate
-    double get_integrated_loudness() const {
-        if (total_count == 0) return SILENCE_THRESHOLD;
-
-        // Relative gate: -10 dB below ungated mean
-        double gate_power = cumulative_power * std::pow(10.0, 0.1 * RELATIVE_GATE);
-
-        double sum_power = 0.0;
-        uint64_t count = 0;
-
-        for (const auto& bin : bins) {
-            if (bin.count > 0 && bin.power_lo > gate_power) {
-                sum_power += static_cast<double>(bin.count) * bin.power_lo;
-                count += bin.count;
-            }
-        }
-
-        if (count == 0) return SILENCE_THRESHOLD;
-        return power_to_lufs(sum_power / static_cast<double>(count));
-    }
-
-    // Get loudness range (LRA) - Per EBU R 128 / ITU-R BS.1770-4
-    // Uses short-term histogram with -20 dB relative gate and 10-95 percentile
-    // Following lib1770 reference implementation exactly
-    double get_loudness_range() const {
-        if (total_count == 0) return 0.0;
-
-        // Relative gate for LRA: -20 dB below ungated mean (EBU R 128 tech doc)
-        // gate = pass1.wmsq * pow(10, 0.1 * gate_db)
-        double gate_power = cumulative_power * std::pow(10.0, 0.1 * (-20.0));
-
-        // Count total blocks above gate (first pass)
-        uint64_t gated_count = 0;
-        for (const auto& bin : bins) {
-            // gate < rp->x && 0 < rp->count
-            if (gate_power < bin.power_lo && bin.count > 0) {
-                gated_count += bin.count;
-            }
-        }
-
-        if (gated_count == 0) return 0.0;
-
-        // Per EBU R 128: 10th and 95th percentile
-        // lower_count = count * lower, upper_count = count * upper
-        uint64_t lower_count = static_cast<uint64_t>(gated_count * LRA_LOWER_PERCENTILE);
-        uint64_t upper_count = static_cast<uint64_t>(gated_count * LRA_UPPER_PERCENTILE);
-
-        double min_db = std::nan("");
-        double max_db = std::nan("");
-
-        uint64_t count = 0;
-        uint64_t prev_count = static_cast<uint64_t>(-1);  // Same as lib1770: -1 cast to unsigned
-
-        // Second pass: find percentiles
-        for (const auto& bin : bins) {
-            // Only include loudness levels above gate threshold
-            // gate < rp->x (note: we don't check count here, same as lib1770)
-            if (gate_power < bin.power_lo) {
-                count += bin.count;
-
-                // Initialize min/max if not done yet
-                if (std::isnan(min_db) || std::isnan(max_db)) {
-                    min_db = bin.db;
-                    max_db = bin.db;
-                    prev_count = count;
-                    continue;
-                }
-
-                // Check for lower percentile crossing
-                // prev_count < lower_count && lower_count <= count
-                if (prev_count < lower_count && lower_count <= count) {
-                    min_db = bin.db;
-                }
-
-                // Check for upper percentile crossing
-                // prev_count < upper_count && upper_count <= count
-                if (prev_count < upper_count && upper_count <= count) {
-                    max_db = bin.db;
-                    break;
-                }
-
-                prev_count = count;
-            }
-        }
-
-        // Return range, or 0 if calculation failed
-        if (std::isnan(min_db) || std::isnan(max_db)) {
-            return 0.0;
-        }
-
-        return max_db - min_db;
-    }
-
-    // Get maximum loudness
-    double get_max_loudness() const {
-        return power_to_lufs(max_power);
-    }
+    double get_max_loudness() const { return power_to_lufs(max_power); }
 };
 
 // ============================================================================
@@ -698,39 +653,43 @@ LoudnessMeter::BiquadCoeffs LoudnessMeter::calc_high_pass(double sample_rate) {
 // Helper: Ensure minimum audio length for accurate measurement
 //
 // Short-term block requires 3000ms, so we loop audio to at least 4 seconds
-// to ensure proper BS.1770-4 measurement (same as bs1770gain behavior)
+// to ensure proper BS.1770-4 measurement. For looped buffers we add one
+// extra loop at the front to be used as a K-weighting filter warmup; the
+// caller is expected to feed those frames through the filter without
+// registering blocks, so that the measured region runs on a settled IIR.
 // ============================================================================
 
-static const float* ensure_minimum_length(const std::vector<float>& samples,
-                                          size_t& total_frames,
-                                          int channels,
-                                          uint32_t sample_rate,
-                                          std::vector<float>& looped_storage) {
-    double duration_ms = (static_cast<double>(total_frames) * 1000.0) / sample_rate;
-    constexpr double MIN_DURATION_MS = 4000.0;  // 4 seconds minimum for shortterm measurement
+struct LoudnessBuffer {
+    const float* samples;
+    size_t total_frames;
+    size_t warmup_frames;  // Frames at the start that should be discarded
+};
 
-    if (duration_ms >= MIN_DURATION_MS) {
-        return samples.data();  // Already long enough, no copy
+static LoudnessBuffer prepare_loudness_buffer(const std::vector<float>& samples,
+                                              size_t original_frames,
+                                              int channels,
+                                              uint32_t sample_rate,
+                                              std::vector<float>& looped_storage) {
+    double duration_ms = (static_cast<double>(original_frames) * 1000.0) / sample_rate;
+    constexpr double MIN_DURATION_MS = 4000.0;
+
+    if (duration_ms >= MIN_DURATION_MS || original_frames == 0) {
+        return {samples.data(), original_frames, 0};
     }
 
-    size_t original_frames = total_frames;
     size_t min_frames = static_cast<size_t>((MIN_DURATION_MS / 1000.0) * sample_rate);
-
-    // Calculate how many times we need to loop
-    size_t loops_needed = (min_frames + original_frames - 1) / original_frames;
-    size_t new_total_frames = original_frames * loops_needed;
+    size_t loops_for_min = (min_frames + original_frames - 1) / original_frames;
+    size_t loops_total = loops_for_min + 1;  // extra loop for filter warmup
+    size_t new_total_frames = original_frames * loops_total;
 
     looped_storage.resize(new_total_frames * channels);
-
-    // Copy and loop the audio
-    for (size_t loop = 0; loop < loops_needed; ++loop) {
+    for (size_t loop = 0; loop < loops_total; ++loop) {
         std::memcpy(looped_storage.data() + (loop * original_frames * channels),
                     samples.data(),
                     original_frames * channels * sizeof(float));
     }
 
-    total_frames = new_total_frames;
-    return looped_storage.data();
+    return {looped_storage.data(), new_total_frames, original_frames};
 }
 
 // ============================================================================
@@ -766,10 +725,12 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
     }
 
     // Loop short audio to minimum length for accurate BS.1770-4 measurement
-    size_t total_frames = audio.total_frames;
     std::vector<float> looped_samples;
-    const float* samples = ensure_minimum_length(
-        audio.samples, total_frames, channels, audio.sample_rate, looped_samples);
+    LoudnessBuffer buf = prepare_loudness_buffer(
+        audio.samples, audio.total_frames, channels, audio.sample_rate, looped_samples);
+    const float* samples = buf.samples;
+    const size_t total_frames = buf.total_frames;
+    const size_t warmup_frames = buf.warmup_frames;
 
     // Initialize K-weighting filter
     KWeightingFilter kfilter(sample_rate, channels);
@@ -784,7 +745,6 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
     // Separate histogram for LRA (uses short-term blocks)
     LoudnessHistogram shortterm_histogram;
 
-    // バッチ処理化: 4096フレームずつ処理
     constexpr size_t BATCH_SIZE = 4096;
     std::vector<double> weighted_sq_batch(BATCH_SIZE);
 
@@ -801,8 +761,17 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
             }
         }
 
-        momentary.add_samples(weighted_sq_batch.data(), batch_frames, momentary_histogram);
-        shortterm.add_samples(weighted_sq_batch.data(), batch_frames, shortterm_histogram);
+        size_t start = 0;
+        if (frame < warmup_frames) {
+            // Warmup region: filter state is updated, blocks discarded
+            start = std::min(batch_frames, warmup_frames - frame);
+        }
+        if (start < batch_frames) {
+            momentary.add_samples(weighted_sq_batch.data() + start, batch_frames - start,
+                                  momentary_histogram);
+            shortterm.add_samples(weighted_sq_batch.data() + start, batch_frames - start,
+                                  shortterm_histogram);
+        }
 
         frame += batch_frames;
     }
@@ -835,7 +804,7 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
 
     // If LRA is zero or negative and we don't have enough short-term blocks
     if (result.range <= 0.0 && shortterm_histogram.total_count < 2) {
-        result.range = 20.0;
+        result.range = 0.0;
     }
 
     return result;
@@ -873,22 +842,20 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     const uint64_t tc_samples = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
 
     // Loop short audio to minimum length for accurate BS.1770-4 measurement
-    size_t total_frames = audio.total_frames;
     std::vector<float> looped_samples;
-    const float* samples = ensure_minimum_length(
-        audio.samples, total_frames, channels, audio.sample_rate, looped_samples);
+    LoudnessBuffer buf = prepare_loudness_buffer(
+        audio.samples, original_frames, channels, audio.sample_rate, looped_samples);
+    const float* samples = buf.samples;
+    const size_t total_frames = buf.total_frames;
+    const size_t warmup_frames = buf.warmup_frames;
+    const size_t rms_end = warmup_frames + original_frames;  // RMS is computed only over the real audio window
 
     // Initialize K-weighting filter
     KWeightingFilter kfilter(sample_rate, channels);
 
-    // Initialize block aggregators
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
-
-    // Histogram for integrated loudness (uses momentary blocks)
     LoudnessHistogram momentary_histogram;
-
-    // Separate histogram for LRA (uses short-term blocks)
     LoudnessHistogram shortterm_histogram;
 
     float sample_peak_linear = 0.0f;
@@ -898,80 +865,43 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
     std::vector<double> sum_sq(channels, 0.0);
 
-    // Process original frames (RMS + loudness)
-    const size_t gate_start = std::min(original_frames, static_cast<size_t>(tc_samples));
+    // Sample peak from original audio only
+    sample_peak_linear = simd::find_peak_abs(audio.samples.data(),
+                                             original_frames * static_cast<size_t>(channels));
 
-    for (size_t frame = 0; frame < gate_start; ++frame) {
-        const float* frame_samples = samples + frame * channels;
-        for (int ch = 0; ch < channels; ++ch) {
-            float s = frame_samples[ch];
-            float abs_s = std::fabs(s);
-            if (abs_s > sample_peak_linear) {
-                sample_peak_linear = abs_s;
-            }
-
-            double sample_sq = static_cast<double>(s) * static_cast<double>(s);
-            sum_sq[ch] += sample_sq;
-            avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
-        }
-
-        double weighted_sq = kfilter.process_frame(frame_samples);
-
-        double block_power;
-        if (momentary.add_sample(weighted_sq, block_power)) {
-            momentary_histogram.add_block(block_power);
-        }
-
-        if (shortterm.add_sample(weighted_sq, block_power)) {
-            shortterm_histogram.add_block(block_power);
-        }
-    }
-
-    for (size_t frame = gate_start; frame < original_frames; ++frame) {
-        const float* frame_samples = samples + frame * channels;
-        for (int ch = 0; ch < channels; ++ch) {
-            float s = frame_samples[ch];
-            float abs_s = std::fabs(s);
-            if (abs_s > sample_peak_linear) {
-                sample_peak_linear = abs_s;
-            }
-
-            double sample_sq = static_cast<double>(s) * static_cast<double>(s);
-            sum_sq[ch] += sample_sq;
-            avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
-
-            if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
-                max_sigma_x2[ch] = avg_sigma_x2[ch];
-            }
-            if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
-                min_sigma_x2[ch] = avg_sigma_x2[ch];
-            }
-        }
-
-        double weighted_sq = kfilter.process_frame(frame_samples);
-
-        double block_power;
-        if (momentary.add_sample(weighted_sq, block_power)) {
-            momentary_histogram.add_block(block_power);
-        }
-
-        if (shortterm.add_sample(weighted_sq, block_power)) {
-            shortterm_histogram.add_block(block_power);
-        }
-    }
-
-    // Process looped frames for loudness only
-    for (size_t frame = original_frames; frame < total_frames; ++frame) {
+    for (size_t frame = 0; frame < total_frames; ++frame) {
         const float* frame_samples = samples + frame * channels;
         double weighted_sq = kfilter.process_frame(frame_samples);
 
-        double block_power;
-        if (momentary.add_sample(weighted_sq, block_power)) {
-            momentary_histogram.add_block(block_power);
+        // RMS: compute only over the original window
+        if (frame >= warmup_frames && frame < rms_end) {
+            size_t orig_idx = frame - warmup_frames;
+            for (int ch = 0; ch < channels; ++ch) {
+                float s = frame_samples[ch];
+                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
+                sum_sq[ch] += sample_sq;
+                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
+
+                if (orig_idx >= tc_samples) {
+                    if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
+                        max_sigma_x2[ch] = avg_sigma_x2[ch];
+                    }
+                    if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
+                        min_sigma_x2[ch] = avg_sigma_x2[ch];
+                    }
+                }
+            }
         }
 
-        if (shortterm.add_sample(weighted_sq, block_power)) {
-            shortterm_histogram.add_block(block_power);
+        // Loudness: skip warmup region
+        if (frame >= warmup_frames) {
+            double block_power;
+            if (momentary.add_sample(weighted_sq, block_power)) {
+                momentary_histogram.add_block(block_power);
+            }
+            if (shortterm.add_sample(weighted_sq, block_power)) {
+                shortterm_histogram.add_block(block_power);
+            }
         }
     }
 
@@ -1004,7 +934,7 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     }
 
     if (out.loudness.range <= 0.0 && shortterm_histogram.total_count < 2) {
-        out.loudness.range = 20.0;
+        out.loudness.range = 0.0;
     }
 
     // RMS results (SOX behavior)
@@ -1205,8 +1135,14 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     }
 
     if (!loudness_started && buffered_frames > 0) {
-        size_t loops_needed = (min_frames + buffered_frames - 1) / buffered_frames;
-        for (size_t loop = 0; loop < loops_needed; ++loop) {
+        size_t loops_for_min = (min_frames + buffered_frames - 1) / buffered_frames;
+        // Warmup loop: pass through K-weighting filter, do not register blocks
+        for (size_t f = 0; f < buffered_frames; ++f) {
+            const float* fs = short_buffer.data() + f * channels;
+            kfilter.process_frame(fs);
+        }
+        // Measurement loops on a settled filter
+        for (size_t loop = 0; loop < loops_for_min; ++loop) {
             process_loudness_frames(short_buffer.data(), buffered_frames);
         }
     }
@@ -1239,7 +1175,7 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     }
 
     if (out.loudness.range <= 0.0 && shortterm_histogram.total_count < 2) {
-        out.loudness.range = 20.0;
+        out.loudness.range = 0.0;
     }
 
     if (total_frames < tc_samples && total_frames > 0) {

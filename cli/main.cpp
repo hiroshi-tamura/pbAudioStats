@@ -8,60 +8,68 @@
 
 #include "pbAudioStats.h"
 
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <vector>
-#include <string>
-#include <filesystem>
-#include <thread>
-#include <mutex>
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace pb_audio;
+
+// ============================================================================
+// Cancellation (Ctrl+C)
+// ============================================================================
+
+static std::atomic<bool> g_cancelled{false};
+extern "C" void cli_signal_handler(int) {
+    g_cancelled.store(true, std::memory_order_relaxed);
+}
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
 struct Config {
-    // File info options
-    bool show_filename = false;       // -f
-    bool show_filename_ext = false;   // -fe
-    bool show_filepath = false;       // -fea
-    bool show_sample_rate = false;    // -sr
-    bool show_bit_depth = false;      // -bt
-    bool show_channels = false;       // -ch
-    bool show_time = false;           // -tm
-    bool show_duration = false;       // -du
+    bool show_filename = false;
+    bool show_filename_ext = false;
+    bool show_filepath = false;
+    bool show_sample_rate = false;
+    bool show_bit_depth = false;
+    bool show_channels = false;
+    bool show_time = false;
+    bool show_duration = false;
 
-    // Loudness options
-    bool show_integrated = false;     // -i
-    bool show_shortterm = false;      // -s
-    bool show_momentary = false;      // -m
-    bool show_lra = false;            // -l
-    bool show_sample_peak = false;    // -pk (sample peak)
-    bool show_true_peak = false;      // -tp
-    bool show_rms_min = false;        // -rn
-    bool show_rms_max = false;        // -rm
-    bool show_rms_avg = false;        // -ra
+    bool show_integrated = false;
+    bool show_shortterm = false;
+    bool show_momentary = false;
+    bool show_lra = false;
+    bool show_sample_peak = false;
+    bool show_true_peak = false;
+    bool show_rms_min = false;
+    bool show_rms_max = false;
+    bool show_rms_avg = false;
 
-    // Normalization options
     bool normalize = false;
-    Normalizer::Target norm_target;
+    Normalizer::Target norm_target = Normalizer::Target::Peak;
     double norm_value = 0.0;
 
-    // Other
     std::string input_path;
     std::string output_path;
     bool csv_output = false;
-    int num_threads = 0;  // 0 = auto
+    int num_threads = 0;
 
-    bool has_any_output() const {
+    bool has_any_analysis_output() const {
         return show_filename || show_filename_ext || show_filepath ||
                show_sample_rate || show_bit_depth || show_channels ||
                show_time || show_duration ||
@@ -115,12 +123,12 @@ static void print_usage() {
     std::cout << "  -m     Momentary Loudness Maximum (LUFS)\n";
     std::cout << "  -l     Loudness Range LRA (LU)\n";
     std::cout << "  -pk    Sample Peak (dBFS)\n";
-    std::cout << "  -tp    True Peak (dBFS)\n";
+    std::cout << "  -tp    True Peak (dBTP, ITU-R BS.1770-4 4x oversampling)\n";
     std::cout << "  -rn    RMS Minimum (dB)\n";
     std::cout << "  -rm    RMS Maximum (dB)\n";
     std::cout << "  -ra    RMS Average (dB)\n\n";
 
-    std::cout << "Normalization Options (cannot be used with analysis options):\n";
+    std::cout << "Normalization Options (mutually exclusive with analysis options):\n";
     std::cout << "  -norm-pk:<value>   Normalize to Peak value (dBFS)\n";
     std::cout << "  -norm-tp:<value>   Normalize to True Peak value (dBTP)\n";
     std::cout << "  -norm-i:<value>    Normalize to Integrated Loudness (LUFS)\n";
@@ -134,6 +142,9 @@ static void print_usage() {
     std::cout << "  -j<N>  Number of threads for parallel processing (default: auto)\n";
     std::cout << "  -h     Show this help message\n\n";
 
+    std::cout << "If [output_file] ends in .csv the analysis result is written\n";
+    std::cout << "as UTF-8 CSV (with BOM) instead of stdout.\n\n";
+
     std::cout << "Examples:\n";
     std::cout << "  pbAudioStats -i -tp input.wav\n";
     std::cout << "  pbAudioStats -f -fe -i -tp ./audio_folder/ results.csv\n";
@@ -146,34 +157,27 @@ static bool parse_norm_option(const std::string& arg, Config& config) {
 
     std::string type = arg.substr(0, colon);
     std::string value_str = arg.substr(colon + 1);
+    if (value_str.empty()) return false;
 
+    size_t pos = 0;
     try {
-        config.norm_value = std::stod(value_str);
+        config.norm_value = std::stod(value_str, &pos);
     } catch (...) {
         return false;
     }
+    if (pos != value_str.size()) return false;  // Reject "-23xx"
 
     config.normalize = true;
 
-    if (type == "-norm-pk") {
-        config.norm_target = Normalizer::Target::Peak;
-    } else if (type == "-norm-tp") {
-        config.norm_target = Normalizer::Target::TruePeak;
-    } else if (type == "-norm-i") {
-        config.norm_target = Normalizer::Target::Integrated;
-    } else if (type == "-norm-s") {
-        config.norm_target = Normalizer::Target::ShorttermMax;
-    } else if (type == "-norm-m") {
-        config.norm_target = Normalizer::Target::MomentaryMax;
-    } else if (type == "-norm-rn") {
-        config.norm_target = Normalizer::Target::RMSMin;
-    } else if (type == "-norm-rm") {
-        config.norm_target = Normalizer::Target::RMSMax;
-    } else if (type == "-norm-ra") {
-        config.norm_target = Normalizer::Target::RMSAverage;
-    } else {
-        return false;
-    }
+    if      (type == "-norm-pk") config.norm_target = Normalizer::Target::Peak;
+    else if (type == "-norm-tp") config.norm_target = Normalizer::Target::TruePeak;
+    else if (type == "-norm-i")  config.norm_target = Normalizer::Target::Integrated;
+    else if (type == "-norm-s")  config.norm_target = Normalizer::Target::ShorttermMax;
+    else if (type == "-norm-m")  config.norm_target = Normalizer::Target::MomentaryMax;
+    else if (type == "-norm-rn") config.norm_target = Normalizer::Target::RMSMin;
+    else if (type == "-norm-rm") config.norm_target = Normalizer::Target::RMSMax;
+    else if (type == "-norm-ra") config.norm_target = Normalizer::Target::RMSAverage;
+    else return false;
 
     return true;
 }
@@ -187,50 +191,45 @@ static bool parse_args(int argc, char* argv[], Config& config) {
         if (arg == "-h" || arg == "--help") {
             print_usage();
             return false;
-        } else if (arg == "-f") {
-            config.show_filename = true;
-        } else if (arg == "-fe") {
-            config.show_filename_ext = true;
-        } else if (arg == "-fea") {
-            config.show_filepath = true;
-        } else if (arg == "-sr") {
-            config.show_sample_rate = true;
-        } else if (arg == "-bt") {
-            config.show_bit_depth = true;
-        } else if (arg == "-ch") {
-            config.show_channels = true;
-        } else if (arg == "-tm") {
-            config.show_time = true;
-        } else if (arg == "-du") {
-            config.show_duration = true;
-        } else if (arg == "-i") {
-            config.show_integrated = true;
-        } else if (arg == "-s") {
-            config.show_shortterm = true;
-        } else if (arg == "-m") {
-            config.show_momentary = true;
-        } else if (arg == "-l") {
-            config.show_lra = true;
-        } else if (arg == "-pk") {
-            config.show_sample_peak = true;
-        } else if (arg == "-tp") {
-            config.show_true_peak = true;
-        } else if (arg == "-rn") {
-            config.show_rms_min = true;
-        } else if (arg == "-rm") {
-            config.show_rms_max = true;
-        } else if (arg == "-ra") {
-            config.show_rms_avg = true;
-        } else if (arg.rfind("-norm-", 0) == 0) {
+        } else if (arg == "-f")    config.show_filename = true;
+        else if (arg == "-fe")     config.show_filename_ext = true;
+        else if (arg == "-fea")    config.show_filepath = true;
+        else if (arg == "-sr")     config.show_sample_rate = true;
+        else if (arg == "-bt")     config.show_bit_depth = true;
+        else if (arg == "-ch")     config.show_channels = true;
+        else if (arg == "-tm")     config.show_time = true;
+        else if (arg == "-du")     config.show_duration = true;
+        else if (arg == "-i")      config.show_integrated = true;
+        else if (arg == "-s")      config.show_shortterm = true;
+        else if (arg == "-m")      config.show_momentary = true;
+        else if (arg == "-l")      config.show_lra = true;
+        else if (arg == "-pk")     config.show_sample_peak = true;
+        else if (arg == "-tp")     config.show_true_peak = true;
+        else if (arg == "-rn")     config.show_rms_min = true;
+        else if (arg == "-rm")     config.show_rms_max = true;
+        else if (arg == "-ra")     config.show_rms_avg = true;
+        else if (arg.rfind("-norm-", 0) == 0) {
             if (!parse_norm_option(arg, config)) {
-                std::cerr << "Error: Invalid normalization option: " << arg << "\n";
+                std::cerr << "Error: invalid normalization option: " << arg << "\n";
                 return false;
             }
         } else if (arg.rfind("-j", 0) == 0) {
             if (arg.length() > 2) {
-                config.num_threads = std::stoi(arg.substr(2));
+                try {
+                    size_t pos = 0;
+                    int v = std::stoi(arg.substr(2), &pos);
+                    if (pos != arg.size() - 2 || v < 1) {
+                        std::cerr << "Error: -j requires a positive integer (got "
+                                  << arg << ").\n";
+                        return false;
+                    }
+                    config.num_threads = v;
+                } catch (...) {
+                    std::cerr << "Error: invalid -j value: " << arg << "\n";
+                    return false;
+                }
             }
-        } else if (arg[0] == '-') {
+        } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             return false;
         } else {
@@ -248,18 +247,21 @@ static bool parse_args(int argc, char* argv[], Config& config) {
 
     if (positional.size() >= 2) {
         config.output_path = positional[1];
-        // Check if output is CSV
         if (config.output_path.size() >= 4) {
             std::string ext = config.output_path.substr(config.output_path.size() - 4);
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            if (ext == ".csv") {
-                config.csv_output = true;
-            }
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext == ".csv") config.csv_output = true;
         }
     }
 
-    // If no output options specified, show all
-    if (!config.normalize && !config.has_any_output()) {
+    if (config.normalize && config.has_any_analysis_output()) {
+        std::cerr << "Error: analysis options (-f, -i, -tp, ...) cannot be combined "
+                     "with -norm-* options.\n";
+        return false;
+    }
+
+    if (!config.normalize && !config.has_any_analysis_output()) {
         config.set_all_outputs();
     }
 
@@ -267,312 +269,261 @@ static bool parse_args(int argc, char* argv[], Config& config) {
 }
 
 // ============================================================================
-// File Collection
+// File Collection (with size for largest-first scheduling)
 // ============================================================================
 
-static std::vector<std::string> collect_audio_files(const std::string& path) {
-    std::vector<std::string> files;
+struct FileEntry {
+    std::string path;
+    uintmax_t size = 0;
+};
+
+static std::vector<FileEntry> collect_audio_entries(const std::string& path) {
+    std::vector<FileEntry> entries;
+
+    auto try_add = [&entries](const fs::path& p) {
+        std::string s = fs::absolute(p).string();
+        if (AudioReader::detect_format(s) == AudioFormat::Unknown) return;
+        FileEntry e;
+        e.path = std::move(s);
+        std::error_code ec;
+        e.size = fs::file_size(p, ec);
+        if (ec) e.size = 0;
+        entries.push_back(std::move(e));
+    };
 
     if (fs::is_regular_file(path)) {
-        AudioFormat fmt = AudioReader::detect_format(path);
-        if (fmt != AudioFormat::Unknown) {
-            files.push_back(fs::absolute(path).string());
-        }
+        try_add(path);
     } else if (fs::is_directory(path)) {
         for (const auto& entry : fs::recursive_directory_iterator(path)) {
-            if (entry.is_regular_file()) {
-                std::string filepath = entry.path().string();
-                AudioFormat fmt = AudioReader::detect_format(filepath);
-                if (fmt != AudioFormat::Unknown) {
-                    files.push_back(fs::absolute(filepath).string());
-                }
-            }
+            if (entry.is_regular_file()) try_add(entry.path());
         }
-        // Sort files for consistent output
-        std::sort(files.begin(), files.end());
     }
 
-    return files;
+    return entries;
+}
+
+// Schedule largest first to keep the tail short on heterogeneous workloads.
+static void sort_largest_first(std::vector<FileEntry>& entries) {
+    std::sort(entries.begin(), entries.end(),
+              [](const FileEntry& a, const FileEntry& b) {
+                  if (a.size != b.size) return a.size > b.size;
+                  return a.path < b.path;
+              });
 }
 
 // ============================================================================
 // Output Formatting
 // ============================================================================
 
-static std::string format_value(double val, int precision = 2) {
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(precision) << val;
-    return oss.str();
+static void format_double(char* buf, size_t cap, double val, int precision) {
+    std::snprintf(buf, cap, "%.*f", precision, val);
 }
 
-static std::string escape_csv(const std::string& s) {
-    if (s.find(',') != std::string::npos || s.find('"') != std::string::npos) {
-        std::string escaped = "\"";
-        for (char c : s) {
-            if (c == '"') escaped += "\"\"";
-            else escaped += c;
-        }
-        escaped += "\"";
-        return escaped;
+static void append_escaped_csv(std::string& out, const std::string& s) {
+    out.push_back('"');
+    for (char c : s) {
+        if (c == '"') out += "\"\"";
+        else out.push_back(c);
     }
-    return "\"" + s + "\"";
+    out.push_back('"');
 }
 
 static void output_header(const Config& config, std::ostream& out) {
-    std::vector<std::string> headers;
+    bool first = true;
+    auto col = [&](const char* name) {
+        if (!first) out << ',';
+        out << name;
+        first = false;
+    };
 
-    if (config.show_filename) headers.push_back("File name (without extension)");
-    if (config.show_filename_ext) headers.push_back("File name (with extension)");
-    if (config.show_filepath) headers.push_back("Full file path");
-    if (config.show_sample_rate) headers.push_back("Sample rate (Hz)");
-    if (config.show_bit_depth) headers.push_back("Bit depth (bits)");
-    if (config.show_channels) headers.push_back("Number of channels");
-    if (config.show_time) headers.push_back("Total time (HH:MM:SS.mmm)");
-    if (config.show_duration) headers.push_back("Duration (seconds)");
-    if (config.show_integrated) headers.push_back("Integrated Loudness (LUFS)");
-    if (config.show_shortterm) headers.push_back("Short-term Loudness Maximum (LUFS)");
-    if (config.show_momentary) headers.push_back("Momentary Loudness Maximum (LUFS)");
-    if (config.show_lra) headers.push_back("Loudness Range LRA (LU)");
-    if (config.show_sample_peak) headers.push_back("Peak (dBFS)");
-    if (config.show_true_peak) headers.push_back("True Peak (dBFS)");
-    if (config.show_rms_min) headers.push_back("RMS Minimum (dB)");
-    if (config.show_rms_max) headers.push_back("RMS Maximum (dB)");
-    if (config.show_rms_avg) headers.push_back("RMS Average (dB)");
-
-    for (size_t i = 0; i < headers.size(); i++) {
-        if (i > 0) out << ",";
-        out << headers[i];
-    }
-    out << "\n";
+    if (config.show_filename) col("File name (without extension)");
+    if (config.show_filename_ext) col("File name (with extension)");
+    if (config.show_filepath) col("Full file path");
+    if (config.show_sample_rate) col("Sample rate (Hz)");
+    if (config.show_bit_depth) col("Bit depth (bits)");
+    if (config.show_channels) col("Number of channels");
+    if (config.show_time) col("Total time (HH:MM:SS.mmm)");
+    if (config.show_duration) col("Duration (seconds)");
+    if (config.show_integrated) col("Integrated Loudness (LUFS)");
+    if (config.show_shortterm) col("Short-term Loudness Maximum (LUFS)");
+    if (config.show_momentary) col("Momentary Loudness Maximum (LUFS)");
+    if (config.show_lra) col("Loudness Range LRA (LU)");
+    if (config.show_sample_peak) col("Peak (dBFS)");
+    if (config.show_true_peak) col("True Peak (dBTP)");
+    if (config.show_rms_min) col("RMS Minimum (dB)");
+    if (config.show_rms_max) col("RMS Maximum (dB)");
+    if (config.show_rms_avg) col("RMS Average (dB)");
+    out << '\n';
 }
 
 static void output_stats(const Config& config, const AudioStats& stats, std::ostream& out) {
-    std::vector<std::string> values;
+    bool first = true;
+    auto comma = [&]() { if (!first) out << ','; first = false; };
 
-    if (config.show_filename) values.push_back(escape_csv(stats.filename));
-    if (config.show_filename_ext) values.push_back(escape_csv(stats.filename_ext));
-    if (config.show_filepath) values.push_back(escape_csv(stats.filepath));
-    if (config.show_sample_rate) values.push_back(std::to_string(stats.sample_rate));
-    if (config.show_bit_depth) values.push_back(std::to_string(stats.bit_depth));
-    if (config.show_channels) values.push_back(std::to_string(stats.channels));
-    if (config.show_time) values.push_back(stats.duration_formatted);
-    if (config.show_duration) values.push_back(format_value(stats.duration_seconds, 3));
-    if (config.show_integrated) values.push_back(format_value(stats.integrated_loudness, 1));
-    if (config.show_shortterm) values.push_back(format_value(stats.shortterm_max, 1));
-    if (config.show_momentary) values.push_back(format_value(stats.momentary_max, 1));
-    if (config.show_lra) values.push_back(format_value(stats.loudness_range, 1));
-    if (config.show_sample_peak) values.push_back(format_value(stats.sample_peak, 1));
-    if (config.show_true_peak) values.push_back(format_value(stats.true_peak, 2));
-    if (config.show_rms_min) values.push_back(format_value(stats.rms_min, 2));
-    if (config.show_rms_max) values.push_back(format_value(stats.rms_max, 2));
-    if (config.show_rms_avg) values.push_back(format_value(stats.rms_average, 2));
+    char buf[64];
 
-    for (size_t i = 0; i < values.size(); i++) {
-        if (i > 0) out << ",";
-        out << values[i];
-    }
-    out << "\n";
+    if (config.show_filename)     { comma(); std::string s; append_escaped_csv(s, stats.filename);     out << s; }
+    if (config.show_filename_ext) { comma(); std::string s; append_escaped_csv(s, stats.filename_ext); out << s; }
+    if (config.show_filepath)     { comma(); std::string s; append_escaped_csv(s, stats.filepath);     out << s; }
+    if (config.show_sample_rate)  { comma(); out << stats.sample_rate; }
+    if (config.show_bit_depth)    { comma(); out << stats.bit_depth; }
+    if (config.show_channels)     { comma(); out << stats.channels; }
+    if (config.show_time)         { comma(); out << stats.duration_formatted; }
+    if (config.show_duration)     { comma(); format_double(buf, sizeof(buf), stats.duration_seconds, 3); out << buf; }
+    if (config.show_integrated)   { comma(); format_double(buf, sizeof(buf), stats.integrated_loudness, 1); out << buf; }
+    if (config.show_shortterm)    { comma(); format_double(buf, sizeof(buf), stats.shortterm_max, 1); out << buf; }
+    if (config.show_momentary)    { comma(); format_double(buf, sizeof(buf), stats.momentary_max, 1); out << buf; }
+    if (config.show_lra)          { comma(); format_double(buf, sizeof(buf), stats.loudness_range, 1); out << buf; }
+    if (config.show_sample_peak)  { comma(); format_double(buf, sizeof(buf), stats.sample_peak, 1); out << buf; }
+    if (config.show_true_peak)    { comma(); format_double(buf, sizeof(buf), stats.true_peak, 2); out << buf; }
+    if (config.show_rms_min)      { comma(); format_double(buf, sizeof(buf), stats.rms_min, 2); out << buf; }
+    if (config.show_rms_max)      { comma(); format_double(buf, sizeof(buf), stats.rms_max, 2); out << buf; }
+    if (config.show_rms_avg)      { comma(); format_double(buf, sizeof(buf), stats.rms_average, 2); out << buf; }
+    out << '\n';
 }
 
 // ============================================================================
-// Parallel Processing
+// Parallel Analysis
 // ============================================================================
 
-static void process_files_range_serial(const std::vector<std::string>& files,
-                                       size_t start,
-                                       size_t end,
-                                       std::vector<AudioStats>& results,
-                                       std::atomic<size_t>* completed,
-                                       std::mutex* progress_mutex,
-                                       size_t print_every,
-                                       bool use_single_pass) {
-    for (size_t idx = start; idx < end; ++idx) {
-        results[idx] = analyze(files[idx], use_single_pass);
-
-        if (completed && progress_mutex) {
-            size_t done = ++(*completed);
-            if (done % print_every == 0 || done == files.size()) {
-                std::lock_guard<std::mutex> lock(*progress_mutex);
-                std::cerr << "\rProcessing: " << done << "/" << files.size() << " files..." << std::flush;
-            }
-        }
+static void process_files_parallel(const std::vector<FileEntry>& entries,
+                                   const Config& config,
+                                   std::vector<AudioStats>& results) {
+    int num_threads = config.num_threads;
+    if (num_threads <= 0) {
+        num_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
     }
-}
+    // Cap analysis threads to avoid I/O thrashing on systems with many cores.
+    num_threads = std::min(num_threads, 8);
 
-static void process_files_range_parallel(const std::vector<std::string>& files,
-                                         size_t start,
-                                         size_t end,
-                                         int num_threads,
-                                         size_t chunk_size,
-                                         std::vector<AudioStats>& results,
-                                         std::atomic<size_t>& completed,
-                                         std::mutex& progress_mutex,
-                                         size_t print_every,
-                                         bool use_single_pass) {
-    std::atomic<size_t> next_index(start);
+    const size_t total = entries.size();
+    results.resize(total);
+    if (total == 0) return;
+
+    const bool use_single_pass = total < 64;
+    const size_t print_every = (total < 64) ? std::max<size_t>(1, total)
+                                            : std::max<size_t>(1, total / 50);
+
+    std::atomic<size_t> next_index{0};
+    std::atomic<size_t> completed{0};
+    std::mutex progress_mutex;
 
     auto worker = [&]() {
-        while (true) {
-            size_t chunk_start = next_index.fetch_add(chunk_size);
-            if (chunk_start >= end) break;
-            size_t chunk_end = std::min(chunk_start + chunk_size, end);
+        while (!g_cancelled.load(std::memory_order_relaxed)) {
+            size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= total) break;
 
-            for (size_t idx = chunk_start; idx < chunk_end; ++idx) {
-                results[idx] = analyze(files[idx], use_single_pass);
-            }
+            results[idx] = analyze(entries[idx].path, use_single_pass);
 
-            size_t done = completed.fetch_add(chunk_end - chunk_start) + (chunk_end - chunk_start);
-            if (done % print_every == 0 || done == files.size()) {
-                std::lock_guard<std::mutex> lock(progress_mutex);
-                std::cerr << "\rProcessing: " << done << "/" << files.size() << " files..." << std::flush;
+            size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            if (done == total || done % print_every == 0) {
+                std::cerr << "\rProcessing: " << done << "/" << total
+                          << " files..." << std::flush;
             }
         }
     };
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(worker);
-    }
+    threads.reserve(static_cast<size_t>(num_threads));
+    for (int i = 0; i < num_threads; ++i) threads.emplace_back(worker);
+    for (auto& t : threads) t.join();
 
-    for (auto& t : threads) {
-        t.join();
-    }
-}
-
-static void process_files_parallel(const std::vector<std::string>& files,
-                                   const Config& config,
-                                   std::vector<AudioStats>& results) {
-    int num_threads = config.num_threads;
-    if (num_threads <= 0) {
-        num_threads = std::max(1, (int)std::thread::hardware_concurrency());
-    }
-
-    results.resize(files.size());
-    std::atomic<size_t> completed(0);
-    std::mutex progress_mutex;
-
-    const size_t total = files.size();
-    if (total == 0) {
-        return;
-    }
-
-    bool use_single_pass = total < 64;
-    size_t print_every = (total < 64) ? total : std::max<size_t>(10, total / 10);
-    size_t chunk_size = 4;
-    if (total < 128) {
-        chunk_size = 1;
-    }
-
-    if (num_threads == 1) {
-        process_files_range_serial(files, 0, total, results, &completed, &progress_mutex,
-                                   print_every, use_single_pass);
-        std::cerr << "\rProcessing: " << total << "/" << total << " files... Done!\n";
-        return;
-    }
-
-    if (total < 16) {
-        process_files_range_serial(files, 0, total, results, nullptr, nullptr,
-                                   print_every, use_single_pass);
-        std::cerr << "\rProcessing: " << total << "/" << total << " files... Done!\n";
-        return;
-    }
-
-    process_files_range_parallel(files, 0, total, num_threads, chunk_size,
-                                 results, completed, progress_mutex, print_every, use_single_pass);
-    std::cerr << "\rProcessing: " << total << "/" << total << " files... Done!\n";
+    std::lock_guard<std::mutex> lock(progress_mutex);
+    std::cerr << "\rProcessing: " << total << "/" << total
+              << " files... Done!\n";
 }
 
 // ============================================================================
-// Normalization Processing
+// Parallel Normalization
 // ============================================================================
 
 static int process_normalize(const Config& config) {
-    std::vector<std::string> files = collect_audio_files(config.input_path);
-
-    if (files.empty()) {
+    auto entries = collect_audio_entries(config.input_path);
+    if (entries.empty()) {
         std::cerr << "Error: No audio files found.\n";
         return 1;
     }
+    sort_largest_first(entries);
 
-    if (files.size() == 1) {
-        // Single file normalization
-        std::string output = config.output_path;
-        if (output.empty()) {
-            // Overwrite the original file
-            output = files[0];
-        }
+    if (entries.size() == 1) {
+        const std::string& input = entries[0].path;
+        std::string output = config.output_path.empty() ? input : config.output_path;
 
-        std::cout << "Normalizing: " << files[0] << "\n";
+        std::cout << "Normalizing: " << input << "\n";
         std::cout << "  Target: " << config.norm_value << " dB\n";
 
-        if (Normalizer::normalize_and_save(files[0], output, config.norm_target, config.norm_value)) {
-            std::cout << "  Output: " << output << "\n";
-            std::cout << "Done!\n";
-            return 0;
-        } else {
+        if (!Normalizer::normalize_and_save(input, output,
+                                            config.norm_target, config.norm_value)) {
             std::cerr << "Error: Failed to normalize file.\n";
             return 1;
         }
-    } else {
-        // Multiple file normalization
-        std::string output_dir = config.output_path;
-        if (output_dir.empty()) {
-            // Overwrite original files in place
-            output_dir = fs::path(config.input_path).string();
-        }
-
-        if (!fs::exists(output_dir)) {
-            fs::create_directories(output_dir);
-        }
-
-        std::atomic<size_t> success_count(0);
-        std::atomic<size_t> fail_count(0);
-        std::atomic<size_t> current(0);
-
-        int num_threads = config.num_threads;
-        if (num_threads <= 0) {
-            num_threads = std::max(1, (int)std::thread::hardware_concurrency());
-        }
-
-        auto worker = [&](size_t start, size_t end) {
-            for (size_t i = start; i < end; i++) {
-                fs::path p(files[i]);
-                std::string output_file = output_dir + "/" + p.filename().string();
-
-                if (Normalizer::normalize_and_save(files[i], output_file,
-                                                    config.norm_target, config.norm_value)) {
-                    success_count++;
-                } else {
-                    fail_count++;
-                }
-
-                size_t done = ++current;
-                if (done % 10 == 0 || done == files.size()) {
-                    std::cerr << "\rNormalizing: " << done << "/" << files.size() << " files..." << std::flush;
-                }
-            }
-        };
-
-        std::vector<std::thread> threads;
-        size_t chunk = (files.size() + num_threads - 1) / num_threads;
-        for (int i = 0; i < num_threads; i++) {
-            size_t start = i * chunk;
-            size_t end = std::min(start + chunk, files.size());
-            if (start < end) {
-                threads.emplace_back(worker, start, end);
-            }
-        }
-
-        for (auto& t : threads) {
-            t.join();
-        }
-
-        std::cerr << "\rNormalizing: " << files.size() << "/" << files.size() << " files... Done!\n";
-        std::cout << "Success: " << success_count << ", Failed: " << fail_count << "\n";
-        std::cout << "Output directory: " << output_dir << "\n";
-
-        return (fail_count > 0) ? 1 : 0;
+        std::cout << "  Output: " << output << "\n";
+        std::cout << "Done!\n";
+        return 0;
     }
+
+    std::string output_dir = config.output_path.empty()
+        ? fs::path(config.input_path).string()
+        : config.output_path;
+
+    if (!fs::exists(output_dir)) {
+        std::error_code ec;
+        fs::create_directories(output_dir, ec);
+        if (ec) {
+            std::cerr << "Error: cannot create output directory: " << output_dir << "\n";
+            return 1;
+        }
+    }
+
+    int num_threads = config.num_threads;
+    if (num_threads <= 0) {
+        num_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    }
+    // Normalization loads full files into memory; cap aggressively to avoid OOM.
+    num_threads = std::min(num_threads, 4);
+
+    std::atomic<size_t> next_index{0};
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> success_count{0};
+    std::atomic<size_t> fail_count{0};
+    std::mutex progress_mutex;
+
+    const size_t total = entries.size();
+
+    auto worker = [&]() {
+        while (!g_cancelled.load(std::memory_order_relaxed)) {
+            size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= total) break;
+
+            fs::path p(entries[idx].path);
+            std::string output_file = output_dir + "/" + p.filename().string();
+
+            bool ok = Normalizer::normalize_and_save(entries[idx].path, output_file,
+                                                     config.norm_target, config.norm_value);
+            (ok ? success_count : fail_count).fetch_add(1, std::memory_order_relaxed);
+
+            size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            if (done == total || done % std::max<size_t>(1, total / 50) == 0) {
+                std::cerr << "\rNormalizing: " << done << "/" << total
+                          << " files..." << std::flush;
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(num_threads));
+    for (int i = 0; i < num_threads; ++i) threads.emplace_back(worker);
+    for (auto& t : threads) t.join();
+
+    std::cerr << "\rNormalizing: " << total << "/" << total
+              << " files... Done!\n";
+    std::cout << "Success: " << success_count.load()
+              << ", Failed: " << fail_count.load() << "\n";
+    std::cout << "Output directory: " << output_dir << "\n";
+
+    return (fail_count.load() > 0) ? 1 : 0;
 }
 
 // ============================================================================
@@ -586,60 +537,61 @@ int main(int argc, char* argv[]) {
     }
 
     Config config;
-    if (!parse_args(argc, argv, config)) {
-        return 1;
-    }
+    if (!parse_args(argc, argv, config)) return 1;
 
-    // Check input exists
     if (!fs::exists(config.input_path)) {
         std::cerr << "Error: Input path does not exist: " << config.input_path << "\n";
         return 1;
     }
 
-    // Handle normalization mode
+    std::signal(SIGINT, cli_signal_handler);
+
     if (config.normalize) {
         return process_normalize(config);
     }
 
-    // Analysis mode
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    std::vector<std::string> files = collect_audio_files(config.input_path);
-
-    if (files.empty()) {
+    auto entries = collect_audio_entries(config.input_path);
+    if (entries.empty()) {
         std::cerr << "Error: No audio files found.\n";
         return 1;
     }
+    sort_largest_first(entries);
 
-    std::cerr << "Found " << files.size() << " audio file(s).\n";
+    std::cerr << "Found " << entries.size() << " audio file(s).\n";
 
-    // Process files
     std::vector<AudioStats> results;
-    process_files_parallel(files, config, results);
+    process_files_parallel(entries, config, results);
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     std::cerr << "Analysis completed in " << duration.count() << " ms.\n";
 
-    // Output results
+    size_t error_count = 0;
+    for (const auto& s : results) if (!s.valid) ++error_count;
+    if (error_count > 0) {
+        std::cerr << "Warning: " << error_count
+                  << " file(s) failed to load and contain placeholder values.\n";
+    }
+
     if (config.csv_output && !config.output_path.empty()) {
-        std::ofstream out(config.output_path);
+        std::ofstream out(config.output_path, std::ios::binary);
         if (!out) {
             std::cerr << "Error: Cannot open output file: " << config.output_path << "\n";
             return 1;
         }
+        // UTF-8 BOM for Excel compatibility
+        const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+        out.write(reinterpret_cast<const char*>(bom), 3);
+
         output_header(config, out);
-        for (const auto& stats : results) {
-            output_stats(config, stats, out);
-        }
+        for (const auto& stats : results) output_stats(config, stats, out);
         std::cout << "Results written to: " << config.output_path << "\n";
     } else {
-        // Output to console
         output_header(config, std::cout);
-        for (const auto& stats : results) {
-            output_stats(config, stats, std::cout);
-        }
+        for (const auto& stats : results) output_stats(config, stats, std::cout);
     }
 
-    return 0;
+    return (error_count > 0) ? 2 : 0;
 }

@@ -60,15 +60,9 @@ double Normalizer::calculate_gain(const AudioStats& stats, Target target, double
 void Normalizer::apply_gain(AudioData& audio, double gain_db) {
     if (gain_db == 0.0) return;
 
-    double linear_gain = db_to_linear(gain_db);
-
-    for (size_t i = 0; i < audio.samples.size(); i++) {
-        double sample = audio.samples[i] * linear_gain;
-        // Clipping prevention
-        if (sample > 1.0) sample = 1.0;
-        if (sample < -1.0) sample = -1.0;
-        audio.samples[i] = (float)sample;
-    }
+    float linear_gain = static_cast<float>(db_to_linear(gain_db));
+    simd::apply_gain_and_clip(audio.samples.data(), audio.samples.size(),
+                              linear_gain, -1.0f, 1.0f);
 }
 
 // ============================================================================
@@ -137,7 +131,11 @@ static bool write_wav(const std::string& filepath, const AudioData& audio) {
     write_u32_le(buf, data_size);
     file.write((char*)buf, 4);
 
-    // Write samples (little-endian)
+    // Convert all samples into a contiguous byte buffer first, then write
+    // in a single call. This avoids the per-sample stream overhead of
+    // tens of millions of ofstream::write() calls on long files.
+    std::vector<uint8_t> sample_buf(static_cast<size_t>(num_samples) * bytes_per_sample);
+    uint8_t* dst = sample_buf.data();
     for (size_t i = 0; i < num_samples; i++) {
         float s = audio.samples[i];
         if (s > 1.0f) s = 1.0f;
@@ -145,35 +143,39 @@ static bool write_wav(const std::string& filepath, const AudioData& audio) {
 
         switch (bit_depth) {
             case 8: {
-                // 8-bit WAV is unsigned
-                uint8_t v = (uint8_t)((s + 1.0f) * 127.5f);
-                file.write((char*)&v, 1);
+                *dst++ = static_cast<uint8_t>((s + 1.0f) * 127.5f);
                 break;
             }
             case 16: {
-                int16_t v = (int16_t)(s * 32767.0f);
-                write_u16_le(buf, (uint16_t)v);
-                file.write((char*)buf, 2);
+                int16_t v = static_cast<int16_t>(s * 32767.0f);
+                dst[0] = static_cast<uint8_t>(v & 0xFF);
+                dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                dst += 2;
                 break;
             }
             case 24: {
-                int32_t v = (int32_t)(s * 8388607.0f);
-                buf[0] = v & 0xFF;
-                buf[1] = (v >> 8) & 0xFF;
-                buf[2] = (v >> 16) & 0xFF;
-                file.write((char*)buf, 3);
+                int32_t v = static_cast<int32_t>(s * 8388607.0f);
+                dst[0] = static_cast<uint8_t>(v & 0xFF);
+                dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                dst[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+                dst += 3;
                 break;
             }
             case 32: {
-                int32_t v = (int32_t)(s * 2147483647.0f);
-                write_u32_le(buf, (uint32_t)v);
-                file.write((char*)buf, 4);
+                int32_t v = static_cast<int32_t>(s * 2147483647.0f);
+                dst[0] = static_cast<uint8_t>(v & 0xFF);
+                dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                dst[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+                dst[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+                dst += 4;
                 break;
             }
         }
     }
 
-    return true;
+    file.write(reinterpret_cast<const char*>(sample_buf.data()),
+               static_cast<std::streamsize>(sample_buf.size()));
+    return file.good();
 }
 
 // ============================================================================
@@ -259,7 +261,9 @@ static bool write_aiff(const std::string& filepath, const AudioData& audio) {
     write_u32_be(buf, 0);  // blockSize
     file.write((char*)buf, 4);
 
-    // Write samples (big-endian)
+    // Buffer all samples then write at once (see WAV writer above).
+    std::vector<uint8_t> sample_buf(static_cast<size_t>(num_samples) * bytes_per_sample);
+    uint8_t* dst = sample_buf.data();
     for (size_t i = 0; i < num_samples; i++) {
         float s = audio.samples[i];
         if (s > 1.0f) s = 1.0f;
@@ -267,34 +271,39 @@ static bool write_aiff(const std::string& filepath, const AudioData& audio) {
 
         switch (audio.bit_depth) {
             case 8: {
-                int8_t v = (int8_t)(s * 127.0f);
-                file.write((char*)&v, 1);
+                *dst++ = static_cast<uint8_t>(static_cast<int8_t>(s * 127.0f));
                 break;
             }
             case 16: {
-                int16_t v = (int16_t)(s * 32767.0f);
-                write_u16_be(buf, (uint16_t)v);
-                file.write((char*)buf, 2);
+                int16_t v = static_cast<int16_t>(s * 32767.0f);
+                dst[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                dst[1] = static_cast<uint8_t>(v & 0xFF);
+                dst += 2;
                 break;
             }
             case 24: {
-                int32_t v = (int32_t)(s * 8388607.0f);
-                buf[0] = (v >> 16) & 0xFF;
-                buf[1] = (v >> 8) & 0xFF;
-                buf[2] = v & 0xFF;
-                file.write((char*)buf, 3);
+                int32_t v = static_cast<int32_t>(s * 8388607.0f);
+                dst[0] = static_cast<uint8_t>((v >> 16) & 0xFF);
+                dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                dst[2] = static_cast<uint8_t>(v & 0xFF);
+                dst += 3;
                 break;
             }
             case 32: {
-                int32_t v = (int32_t)(s * 2147483647.0f);
-                write_u32_be(buf, (uint32_t)v);
-                file.write((char*)buf, 4);
+                int32_t v = static_cast<int32_t>(s * 2147483647.0f);
+                dst[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+                dst[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+                dst[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+                dst[3] = static_cast<uint8_t>(v & 0xFF);
+                dst += 4;
                 break;
             }
         }
     }
 
-    return true;
+    file.write(reinterpret_cast<const char*>(sample_buf.data()),
+               static_cast<std::streamsize>(sample_buf.size()));
+    return file.good();
 }
 
 // ============================================================================
@@ -305,29 +314,23 @@ bool Normalizer::normalize_and_save(const std::string& input_path,
                                     const std::string& output_path,
                                     Target target,
                                     double target_value) {
-    // Load audio
+    // Load once and analyze the loaded buffer to avoid double I/O.
     auto audio = AudioReader::load(input_path);
     if (!audio) return false;
 
-    // Analyze current levels
-    AudioStats stats = analyze(input_path);
+    AudioStats stats = analyze(*audio, input_path);
+    if (!stats.valid) return false;
 
-    // Calculate gain
     double gain = calculate_gain(stats, target, target_value);
-
-    // Apply gain
     apply_gain(*audio, gain);
 
-    // Detect output format
     AudioFormat format = AudioReader::detect_format(output_path);
-
     switch (format) {
         case AudioFormat::WAV:
             return write_wav(output_path, *audio);
         case AudioFormat::AIFF:
             return write_aiff(output_path, *audio);
         default:
-            // Default to WAV if format unknown
             return write_wav(output_path, *audio);
     }
 }
