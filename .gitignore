@@ -26,3 +26,10 @@ Thumbs.db
 # Temporary
 *.tmp
 *.log
+
+# Local-only files (never push)
+HANDOVER.md
+HANDOVER.md.bak
+HANDOVER.md.pbterm-prev.bak
+pbTermLog.txt
+deploy_and_build.sh
