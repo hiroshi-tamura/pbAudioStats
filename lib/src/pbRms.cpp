@@ -1,5 +1,5 @@
 /*
- * pb_rms.cpp - RMS Measurement (SOX compatible)
+ * pbRms.cpp - RMS Measurement (SOX compatible)
  * Uses exponential moving average with 50ms time constant (SOX default)
  *
  * SOX uses exponential smoothing for RMS Peak/Trough:
@@ -15,8 +15,8 @@
  * Only -inf is floored to -96 dB for SOX compatibility.
  */
 
-#include "pb_audio_stats.h"
-#include "pb_simd.h"
+#include "pbAudioStats.h"
+#include "pbSimd.h"
 #include <cmath>
 #include <limits>
 #include <algorithm>

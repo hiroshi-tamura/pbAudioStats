@@ -1,16 +1,16 @@
 /*
- * pb_truepeak.cpp - True Peak Measurement
+ * pbTruePeak.cpp - True Peak Measurement
  *
  * This implementation uses Sample Peak measurement (same as SOX "Pk lev dB")
  * instead of ITU-R BS.1770-4 inter-sample peak detection.
  *
  * SOX compatible: Finds the maximum absolute sample value and converts to dB.
  *
- * SIMD optimizations: Uses pb_simd.h for accelerated peak detection.
+ * SIMD optimizations: Uses pbSimd.h for accelerated peak detection.
  */
 
-#include "pb_audio_stats.h"
-#include "pb_simd.h"
+#include "pbAudioStats.h"
+#include "pbSimd.h"
 #include <cmath>
 #include <vector>
 #include <algorithm>

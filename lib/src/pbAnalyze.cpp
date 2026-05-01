@@ -1,9 +1,9 @@
 /*
- * pb_analyze.cpp - Main Analysis Function
+ * pbAnalyze.cpp - Main Analysis Function
  */
 
-#include "pb_audio_stats.h"
-#include "pb_simd.h"
+#include "pbAudioStats.h"
+#include "pbSimd.h"
 #include <filesystem>
 
 namespace fs = std::filesystem;

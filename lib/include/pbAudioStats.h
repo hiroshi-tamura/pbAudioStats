@@ -1,5 +1,5 @@
 /*
- * pb_audio_stats.h - Audio Statistics Library
+ * pbAudioStats.h - Audio Statistics Library
  * Supports: WAV, AIFF, MP3
  * Features: BS.1770-4 Loudness, True Peak, RMS, Normalization
  */

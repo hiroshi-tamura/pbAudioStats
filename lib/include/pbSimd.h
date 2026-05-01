@@ -1,5 +1,5 @@
 /*
- * pb_simd.h - SIMD Abstraction Layer
+ * pbSimd.h - SIMD Abstraction Layer
  * Supports: AVX2 (x86-64), NEON (ARM64), Scalar fallback
  */
 

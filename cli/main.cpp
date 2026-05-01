@@ -1,12 +1,12 @@
 /*
- * pb_audio_stats CLI Tool
- * Usage: pb_audio_stats [options] <file_or_directory> [output_file]
+ * pbAudioStats CLI Tool
+ * Usage: pbAudioStats [options] <file_or_directory> [output_file]
  *
  * Supports: WAV, AIFF, MP3
  * Features: BS.1770-4 Loudness, True Peak, RMS, Normalization
  */
 
-#include "pb_audio_stats.h"
+#include "pbAudioStats.h"
 
 #include <iostream>
 #include <fstream>
@@ -96,8 +96,8 @@ struct Config {
 // ============================================================================
 
 static void print_usage() {
-    std::cout << "pb_audio_stats - Audio Statistics and Normalization Tool\n\n";
-    std::cout << "Usage: pb_audio_stats [options] <file_or_directory> [output_file]\n\n";
+    std::cout << "pbAudioStats - Audio Statistics and Normalization Tool\n\n";
+    std::cout << "Usage: pbAudioStats [options] <file_or_directory> [output_file]\n\n";
 
     std::cout << "File Information Options:\n";
     std::cout << "  -f     File name (without extension)\n";
@@ -135,9 +135,9 @@ static void print_usage() {
     std::cout << "  -h     Show this help message\n\n";
 
     std::cout << "Examples:\n";
-    std::cout << "  pb_audio_stats -i -tp input.wav\n";
-    std::cout << "  pb_audio_stats -f -fe -i -tp ./audio_folder/ results.csv\n";
-    std::cout << "  pb_audio_stats -norm-i:-23.0 input.wav output.wav\n";
+    std::cout << "  pbAudioStats -i -tp input.wav\n";
+    std::cout << "  pbAudioStats -f -fe -i -tp ./audio_folder/ results.csv\n";
+    std::cout << "  pbAudioStats -norm-i:-23.0 input.wav output.wav\n";
 }
 
 static bool parse_norm_option(const std::string& arg, Config& config) {

@@ -1,11 +1,11 @@
 /*
- * pb_audio_reader.cpp - Audio File Reader
+ * pbAudioReader.cpp - Audio File Reader
  *
  * WAV/AIFF: Native implementation (no external dependencies)
  * MP3: Uses dr_mp3 (header-only, public domain) - MP3 decoding is too complex for native implementation
  */
 
-#include "pb_audio_stats.h"
+#include "pbAudioStats.h"
 #include <fstream>
 #include <cstring>
 #include <cmath>

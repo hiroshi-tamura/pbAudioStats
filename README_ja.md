@@ -1,4 +1,4 @@
-# pb_audio_stats
+# pbAudioStats
 
 BS.1770-4ラウドネス計測、トゥルーピーク検出、RMS分析、オーディオノーマライズ機能を備えた高性能C++オーディオ解析ライブラリ。
 
@@ -46,16 +46,16 @@ cmake --build . --config Release
 
 ```bash
 # 単一ファイルを解析
-pb_audio_stats -i -tp input.wav
+pbAudioStats -i -tp input.wav
 
 # ディレクトリを全オプションで解析
-pb_audio_stats -f -fe -fea -sr -bt -ch -tm -du -i -s -m -l -pk -tp -rn -rm -ra ./audio_folder/
+pbAudioStats -f -fe -fea -sr -bt -ch -tm -du -i -s -m -l -pk -tp -rn -rm -ra ./audio_folder/
 
 # CSVにエクスポート
-pb_audio_stats -i -tp -pk ./audio_folder/ results.csv
+pbAudioStats -i -tp -pk ./audio_folder/ results.csv
 
 # -23 LUFSにノーマライズ
-pb_audio_stats -norm-i:-23.0 input.wav output.wav
+pbAudioStats -norm-i:-23.0 input.wav output.wav
 ```
 
 ### 解析オプション
@@ -96,7 +96,7 @@ pb_audio_stats -norm-i:-23.0 input.wav output.wav
 ## ライブラリの使い方
 
 ```cpp
-#include "pb_audio_stats.h"
+#include "pbAudioStats.h"
 using namespace pb_audio;
 
 int main() {
@@ -150,3 +150,4 @@ int main() {
 | バージョン | 日付 | 変更内容 |
 |-----------|------|----------|
 | 1.0.0 | 2026-01-06 | 初回リリース |
+| 1.1.1 | 2026-05-02 | プロジェクト名を pbAudioStats へ変更 |

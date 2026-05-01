@@ -1,5 +1,5 @@
 /*
- * pb_loudness.cpp - BS.1770-4 Loudness Measurement
+ * pbLoudness.cpp - BS.1770-4 Loudness Measurement
  *
  * Implements:
  * - K-weighting filter (high shelf + high pass biquads)
@@ -12,8 +12,8 @@
  * Reference: ITU-R BS.1770-4, EBU R 128, lib1770-2
  */
 
-#include "pb_audio_stats.h"
-#include "pb_simd.h"
+#include "pbAudioStats.h"
+#include "pbSimd.h"
 #include <cmath>
 #include <cstring>
 #include <vector>

@@ -1,4 +1,4 @@
-# pb_audio_stats
+# pbAudioStats
 
 High-performance C++ audio analysis library with BS.1770-4 loudness measurement, true peak detection, RMS analysis, and audio normalization.
 
@@ -46,16 +46,16 @@ cmake --build . --config Release
 
 ```bash
 # Analyze single file
-pb_audio_stats -i -tp input.wav
+pbAudioStats -i -tp input.wav
 
 # Analyze directory with all options
-pb_audio_stats -f -fe -fea -sr -bt -ch -tm -du -i -s -m -l -pk -tp -rn -rm -ra ./audio_folder/
+pbAudioStats -f -fe -fea -sr -bt -ch -tm -du -i -s -m -l -pk -tp -rn -rm -ra ./audio_folder/
 
 # Export to CSV
-pb_audio_stats -i -tp -pk ./audio_folder/ results.csv
+pbAudioStats -i -tp -pk ./audio_folder/ results.csv
 
 # Normalize to -23 LUFS
-pb_audio_stats -norm-i:-23.0 input.wav output.wav
+pbAudioStats -norm-i:-23.0 input.wav output.wav
 ```
 
 ### Analysis Options
@@ -96,7 +96,7 @@ pb_audio_stats -norm-i:-23.0 input.wav output.wav
 ## Library Usage
 
 ```cpp
-#include "pb_audio_stats.h"
+#include "pbAudioStats.h"
 using namespace pb_audio;
 
 int main() {
@@ -150,3 +150,4 @@ Proprietary
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0.0 | 2026-01-06 | Initial release |
+| 1.1.1 | 2026-05-02 | Renamed project to pbAudioStats |

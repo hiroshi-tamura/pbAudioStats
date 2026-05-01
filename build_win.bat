@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM pb_audio_stats Windows Build Script
+REM pbAudioStats Windows Build Script
 REM ============================================================================
 REM Usage: build_win.bat [Release|Debug]
 REM ============================================================================
@@ -12,7 +12,7 @@ set BUILD_TYPE=%1
 if "%BUILD_TYPE%"=="" set BUILD_TYPE=Release
 
 echo ============================================
-echo pb_audio_stats Windows Build
+echo pbAudioStats Windows Build
 echo Build Type: %BUILD_TYPE%
 echo ============================================
 
@@ -46,8 +46,8 @@ echo.
 echo ============================================
 echo Build completed successfully!
 echo ============================================
-echo Executable: %BUILD_DIR%\%BUILD_TYPE%\pb_audio_stats.exe
-echo Library:    %BUILD_DIR%\%BUILD_TYPE%\pb_audio_stats_lib.lib
+echo Executable: %BUILD_DIR%\%BUILD_TYPE%\pbAudioStats.exe
+echo Library:    %BUILD_DIR%\%BUILD_TYPE%\pbAudioStatsLib.lib
 
 REM Return to original directory
 cd ..
