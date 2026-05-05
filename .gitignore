@@ -2,6 +2,10 @@
 build_mac/
 build_win/
 
+# Release artifacts
+release*/
+*.zip
+
 # Build intermediates
 CMakeCache.txt
 CMakeFiles/
