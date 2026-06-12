@@ -116,10 +116,14 @@ public:
         double rms_min;
         double rms_max;
         double rms_average;
+        // True peak (dBTP). Filled by measure_stream (single-pass exact
+        // BS.1770-4 oversampled peak); -inf when not computed.
+        double true_peak;
     };
 
     static Result measure(const AudioData& audio);
-    static ExtendedResult measure_with_rms(const AudioData& audio, double window_ms = 50.0);
+    static ExtendedResult measure_with_rms(const AudioData& audio, double window_ms = 50.0,
+                                           double known_sample_peak_linear = -1.0);
     static ExtendedResult measure_stream(AudioStream& stream, double window_ms = 50.0);
 
 private:
@@ -141,6 +145,9 @@ class TruePeakMeter {
 public:
     // 4x oversampling as per BS.1770-4
     static double measure(const AudioData& audio);
+    // Same, but reuses an already-computed sample peak (linear, >= 0) to
+    // avoid a duplicate full-buffer scan and to seed chunk pruning.
+    static double measure(const AudioData& audio, double known_sample_peak_linear);
 
 private:
     static constexpr int OVERSAMPLE_FACTOR = 4;

@@ -6,14 +6,29 @@
  * - Momentary loudness (400ms block, 75% overlap)
  * - Short-term loudness (3000ms block, 67% overlap)
  * - Integrated loudness (with -10 LU relative gate)
- * - Loudness Range (LRA) - 10-95 percentile
- * - Sample Peak
+ * - Loudness Range (LRA) - 10-95 percentile (EBU Tech 3342)
+ * - Sample Peak / True Peak (streaming path)
  *
- * Reference: ITU-R BS.1770-4, EBU R 128, lib1770-2
+ * Performance architecture (all measurement paths share one batched core):
+ * - K-weighting runs chunk-batched with filter state in registers
+ *   (specialized stereo kernel + generic N-channel kernel).
+ * - Block aggregation is O(1)/sample via per-partition segment sums
+ *   (one SIMD partial sum per segment instead of `partition` ring adds
+ *   per sample). Mathematically identical to the previous ring buffer.
+ * - SOX-compatible RMS EMA runs chunk-batched per channel with the
+ *   recurrence kept in registers (the EMA itself is inherently serial).
+ * - True peak is computed in the streaming path with the same polyphase
+ *   scanner as TruePeakMeter (single pass, exact).
+ * - Denormals are flushed in hardware (FTZ/DAZ) on x86; on other targets
+ *   the biquad output is flushed at 1e-30 as before.
+ *
+ * Reference: ITU-R BS.1770-4, EBU R 128, EBU Tech 3341/3342, lib1770-2
  */
 
 #include "pbAudioStats.h"
 #include "pbSimd.h"
+#include "pbTruePeakScanner.h"
+
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -45,6 +60,9 @@ static constexpr int HIST_NBINS = static_cast<int>(HIST_GRAIN * (HIST_MAX_DB - H
 static constexpr double LRA_LOWER_PERCENTILE = 0.10;
 static constexpr double LRA_UPPER_PERCENTILE = 0.95;
 
+// Batch size (frames) for the chunked measurement core
+static constexpr size_t BATCH_FRAMES = 4096;
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -61,11 +79,38 @@ static inline double lufs_to_power(double lufs) {
 }
 
 // Flush small biquad outputs to zero to avoid denormal slowdowns.
-// Threshold ~1e-30 sits well below any audible level (~-300 dB) so it does not
-// affect measurement of low-level signals.
+// On x86 (AVX2 builds) hardware FTZ/DAZ is enabled for the duration of each
+// measurement (see DenormalGuard), so this is a no-op there. Other targets
+// keep the 1e-30 flush (well below any audible level, ~-300 dB).
 static inline double denormalize(double x) {
+#if defined(PB_SIMD_AVX2)
+    return x;
+#else
     return (std::fabs(x) < 1.0e-30) ? 0.0 : x;
+#endif
 }
+
+namespace {
+
+// RAII guard: set FTZ (flush-to-zero) + DAZ (denormals-are-zero) on x86 so the
+// IIR/EMA decay tails cannot hit denormal slowpaths; restores MXCSR on exit.
+// Values this small are ~-300 dB and far below the -70 LUFS absolute gate and
+// the displayed precision, so measurement results are unaffected.
+struct DenormalGuard {
+#if defined(PB_SIMD_AVX2)
+    unsigned int old_csr;
+    DenormalGuard() : old_csr(_mm_getcsr()) {
+        _mm_setcsr(old_csr | 0x8040u);  // FTZ (bit 15) | DAZ (bit 6)
+    }
+    ~DenormalGuard() { _mm_setcsr(old_csr); }
+#else
+    DenormalGuard() {}
+#endif
+    DenormalGuard(const DenormalGuard&) = delete;
+    DenormalGuard& operator=(const DenormalGuard&) = delete;
+};
+
+}  // namespace
 
 // ============================================================================
 // Biquad Filter State
@@ -173,41 +218,53 @@ static void requantize_biquad(const BiquadFilter& ref, double ref_rate,
     double k_by_q = k / p.q;
     double a0 = 1.0 + k_by_q + k_sq;
 
-    out.a1 = denormalize((2.0 * (k_sq - 1.0)) / a0);
-    out.a2 = denormalize((1.0 - k_by_q + k_sq) / a0);
-    out.b0 = denormalize((p.vh + p.vb * k_by_q + p.vl * k_sq) / a0);
-    out.b1 = denormalize((2.0 * (p.vl * k_sq - p.vh)) / a0);
-    out.b2 = denormalize((p.vh - p.vb * k_by_q + p.vl * k_sq) / a0);
+    out.a1 = (2.0 * (k_sq - 1.0)) / a0;
+    out.a2 = (1.0 - k_by_q + k_sq) / a0;
+    out.b0 = (p.vh + p.vb * k_by_q + p.vl * k_sq) / a0;
+    out.b1 = (2.0 * (p.vl * k_sq - p.vh)) / a0;
+    out.b2 = (p.vh - p.vb * k_by_q + p.vl * k_sq) / a0;
 }
 
 // ============================================================================
 // Channel Weights (per BS.1770-4)
+//
+// G values by channel position. Channel order assumptions follow the
+// standard WAV channel masks for each common count:
+//   1ch  mono            : C                          -> 1.0
+//   2ch  stereo          : L R                        -> 1.0 1.0
+//   3ch  L R C           : 1.0 x3
+//   4ch  quad            : L R Ls Rs                  -> surrounds weighted
+//   5ch  5.0             : L R C Ls Rs                -> surrounds weighted
+//   6ch  5.1             : L R C LFE Ls Rs            -> LFE excluded
+//   7ch  6.1             : L R C LFE Cs Ls Rs         -> LFE excluded
+//   8ch  7.1             : L R C LFE Lrs Rrs Ls Rs    -> LFE excluded
+//   >8ch                 : all 1.0 (unknown layout)
 // ============================================================================
 
-// G values for channel weighting
-// L, R, C: 1.0
-// Ls, Rs (surround): 1.41 (~+1.5 dB)
-// LFE: excluded (0.0)
 static double get_channel_weight(int channel_index, int total_channels) {
-    // For stereo: L=0, R=1 -> weight 1.0
-    // For 5.1: L=0, R=1, C=2, LFE=3, Ls=4, Rs=5
-
-    if (total_channels <= 2) {
-        return 1.0;  // Stereo or mono
-    }
-
-    // BS.1770-4: surrounds get +1.5 dB = 10^0.15 ≈ 1.41253754...
+    // BS.1770-4: surrounds get +1.5 dB = 10^0.15 = 1.41253754...
     static const double SURROUND_WEIGHT = std::pow(10.0, 0.15);
 
-    // 5.1 layout
-    switch (channel_index) {
-        case 0: return 1.0;              // Left
-        case 1: return 1.0;              // Right
-        case 2: return 1.0;              // Center
-        case 3: return 0.0;              // LFE (excluded)
-        case 4: return SURROUND_WEIGHT;  // Left Surround
-        case 5: return SURROUND_WEIGHT;  // Right Surround
-        default: return 1.0;
+    switch (total_channels) {
+        case 1:
+        case 2:
+        case 3:
+            return 1.0;
+        case 4:  // quad: L R Ls Rs
+            return (channel_index >= 2) ? SURROUND_WEIGHT : 1.0;
+        case 5:  // 5.0: L R C Ls Rs
+            return (channel_index >= 3) ? SURROUND_WEIGHT : 1.0;
+        case 6:  // 5.1: L R C LFE Ls Rs
+            if (channel_index == 3) return 0.0;
+            return (channel_index >= 4) ? SURROUND_WEIGHT : 1.0;
+        case 7:  // 6.1: L R C LFE Cs Ls Rs
+            if (channel_index == 3) return 0.0;
+            return (channel_index >= 4) ? SURROUND_WEIGHT : 1.0;
+        case 8:  // 7.1: L R C LFE Lrs Rrs Ls Rs
+            if (channel_index == 3) return 0.0;
+            return (channel_index >= 4) ? SURROUND_WEIGHT : 1.0;
+        default:
+            return 1.0;
     }
 }
 
@@ -339,138 +396,87 @@ public:
 // ============================================================================
 // Sliding Block Aggregator
 //
-// Implements overlapping window measurement per BS.1770-4
+// Implements overlapping window measurement per BS.1770-4.
+//
+// O(1)/sample formulation: instead of adding every sample to all active
+// partitions (`partition` memory RMWs per sample), keep one running segment
+// sum; at each partition boundary (every overlap_size samples) store it in a
+// small ring. A completed block's power is the sum of the last `partition`
+// segment sums (times 1/block_size). This is algebraically identical to the
+// previous per-partition ring accumulation.
+//
+// Note: max_power tracks the maximum block power UNGATED, per EBU Tech 3341
+// (momentary/short-term maxima are defined without the -70 LUFS gate). The
+// histogram (used for integrated loudness / LRA) still receives only blocks
+// above the absolute gate, as required for gating.
 // ============================================================================
 
 class BlockAggregator {
 public:
-    double length_ms;
-    int partition;        // Number of sub-blocks for overlap
-
     double sample_rate;
     size_t overlap_size;  // Samples per partition
-    size_t block_size;    // Total samples in block
+    size_t partition;     // Number of sub-blocks for overlap
     double scale;         // 1/block_size for averaging
 
-    // Ring buffer for partial sums
-    std::vector<double> ring;
-    size_t ring_used;
-    size_t ring_offset;
+    // Segment-sum ring
+    std::vector<double> seg_sums;
+    size_t seg_head;
+    uint64_t seg_count;
+    double seg_accum;
     size_t sample_count;
 
     // Silence gate threshold (power domain)
     double silence_gate;
 
-    // Maximum block power seen
+    // Maximum block power seen (ungated)
     double max_power;
 
     BlockAggregator(double rate, double ms, int part)
-        : length_ms(ms), partition(part), sample_rate(rate), max_power(0.0) {
+        : sample_rate(rate), max_power(0.0) {
+        partition = static_cast<size_t>(part);
+        overlap_size = static_cast<size_t>(std::round((ms / 1000.0) * rate / part));
+        if (overlap_size == 0) overlap_size = 1;
+        scale = 1.0 / static_cast<double>(partition * overlap_size);
 
-        overlap_size = static_cast<size_t>(std::round((ms / 1000.0) * rate / partition));
-        block_size = partition * overlap_size;
-        scale = 1.0 / static_cast<double>(block_size);
-
-        ring.resize(partition, 0.0);
-        ring_used = 1;
-        ring_offset = 0;
+        seg_sums.assign(partition, 0.0);
+        seg_head = 0;
+        seg_count = 0;
+        seg_accum = 0.0;
         sample_count = 0;
 
         silence_gate = lufs_to_power(SILENCE_THRESHOLD);
     }
 
-    // Add weighted squared sample to current block
-    // Returns true if a block was completed, with the block power in out_power
-    bool add_sample(double weighted_sq, double& out_power) {
-        bool completed = false;
-        out_power = 0.0;
+    // Add a batch of weighted squared samples; completed gated blocks are
+    // registered into `histogram`.
+    void add_batch(const double* weighted_sq, size_t count, LoudnessHistogram& histogram) {
+        size_t i = 0;
+        while (i < count) {
+            size_t take = overlap_size - sample_count;
+            size_t remain = count - i;
+            if (take > remain) take = remain;
 
-        // Accumulate to all active partitions
-        if (weighted_sq >= 1.0e-15) {
-            double scaled = weighted_sq * scale;
-            for (size_t i = 0; i < ring_used; ++i) {
-                ring[i] += scaled;
-            }
-        }
+            seg_accum += simd::sum_pd(weighted_sq + i, take);
+            sample_count += take;
+            i += take;
 
-        // Check if overlap period completed
-        if (++sample_count >= overlap_size) {
-            size_t next_offset = (ring_offset + 1) % partition;
+            if (sample_count == overlap_size) {
+                seg_sums[seg_head] = seg_accum;
+                seg_head = (seg_head + 1 == partition) ? 0 : seg_head + 1;
+                seg_accum = 0.0;
+                sample_count = 0;
+                ++seg_count;
 
-            // If buffer is full, output the oldest block
-            if (ring_used == static_cast<size_t>(partition)) {
-                double block_power = ring[next_offset];
+                if (seg_count >= partition) {
+                    double block_power = 0.0;
+                    for (size_t k = 0; k < partition; ++k) block_power += seg_sums[k];
+                    block_power *= scale;
 
-                // Apply silence gate
-                if (block_power > silence_gate) {
-                    out_power = block_power;
-                    completed = true;
-
-                    if (block_power > max_power) {
-                        max_power = block_power;
-                    }
-                }
-            }
-
-            // Reset next partition and advance
-            ring[next_offset] = 0.0;
-            sample_count = 0;
-            ring_offset = next_offset;
-
-            if (ring_used < static_cast<size_t>(partition)) {
-                ++ring_used;
-            }
-        }
-
-        return completed;
-    }
-
-    // Add a batch of weighted squared samples to current block.
-    void add_samples(const double* weighted_sq, size_t count, LoudnessHistogram& histogram) {
-        size_t ring_used_local = ring_used;
-        size_t ring_offset_local = ring_offset;
-        size_t sample_count_local = sample_count;
-        double max_power_local = max_power;
-        const size_t partition_size = static_cast<size_t>(partition);
-
-        double* ring_data = ring.data();
-
-        for (size_t i = 0; i < count; ++i) {
-            double wsq = weighted_sq[i];
-            if (wsq >= 1.0e-15) {
-                double scaled = wsq * scale;
-                for (size_t r = 0; r < ring_used_local; ++r) {
-                    ring_data[r] += scaled;
-                }
-            }
-
-            if (++sample_count_local >= overlap_size) {
-                size_t next_offset = (ring_offset_local + 1) % partition_size;
-
-                if (ring_used_local == partition_size) {
-                    double block_power = ring_data[next_offset];
-                    if (block_power > silence_gate) {
-                        histogram.add_block(block_power);
-                        if (block_power > max_power_local) {
-                            max_power_local = block_power;
-                        }
-                    }
-                }
-
-                ring_data[next_offset] = 0.0;
-                sample_count_local = 0;
-                ring_offset_local = next_offset;
-
-                if (ring_used_local < partition_size) {
-                    ++ring_used_local;
+                    if (block_power > max_power) max_power = block_power;
+                    if (block_power > silence_gate) histogram.add_block(block_power);
                 }
             }
         }
-
-        ring_used = ring_used_local;
-        ring_offset = ring_offset_local;
-        sample_count = sample_count_local;
-        max_power = max_power_local;
     }
 
     double get_max_loudness() const {
@@ -479,7 +485,7 @@ public:
 };
 
 // ============================================================================
-// K-weighting Pre-filter
+// K-weighting Pre-filter (chunk-batched)
 // ============================================================================
 
 class KWeightingFilter {
@@ -536,90 +542,15 @@ public:
         return weighted_sq;
     }
 
-    // バッチ処理: 複数フレームを一度に処理（4xループアンローリング）
+    // バッチ処理: 複数フレームを一括処理。
+    // ステレオは専用カーネル（状態をレジスタ常駐、4xアンローリング）、
+    // それ以外はチャンネル外側ループの汎用カーネル（状態レジスタ常駐）。
     void process_frames_batch(const float* samples, size_t frame_count, double* weighted_sq_out) {
+        if (frame_count == 0) return;
         if (channels == 2) {
-            // ステレオ専用最化パス
-            const double w0 = high_shelf.b0, w1 = high_shelf.b1, w2 = high_shelf.b2;
-            const double w3 = high_shelf.a1, w4 = high_shelf.a2;
-            const double h0 = high_pass.b0, h1 = high_pass.b1, h2 = high_pass.b2;
-            const double h3 = high_pass.a1, h4 = high_pass.a2;
-
-            double sx1_0 = shelf_states[0].x1, sx2_0 = shelf_states[0].x2, sy1_0 = shelf_states[0].y1, sy2_0 = shelf_states[0].y2;
-            double sx1_1 = shelf_states[1].x1, sx2_1 = shelf_states[1].x2, sy1_1 = shelf_states[1].y1, sy2_1 = shelf_states[1].y2;
-            double hx1_0 = hp_states[0].x1, hx2_0 = hp_states[0].x2, hy1_0 = hp_states[0].y1, hy2_0 = hp_states[0].y2;
-            double hx1_1 = hp_states[1].x1, hx2_1 = hp_states[1].x2, hy1_1 = hp_states[1].y1, hy2_1 = hp_states[1].y2;
-
-            size_t f = 0;
-            while (f + 4 <= frame_count) {
-                const float* frame = samples + f * 2;
-                double x0, y0, x1, y1, z0, z1;
-
-                x0 = static_cast<double>(frame[0]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
-                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
-                x1 = static_cast<double>(frame[1]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
-                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
-                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
-                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
-                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
-                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
-                weighted_sq_out[f] = z0*z0 + z1*z1;
-
-                x0 = static_cast<double>(frame[2]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
-                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
-                x1 = static_cast<double>(frame[3]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
-                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
-                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
-                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
-                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
-                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
-                weighted_sq_out[f+1] = z0*z0 + z1*z1;
-
-                x0 = static_cast<double>(frame[4]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
-                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
-                x1 = static_cast<double>(frame[5]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
-                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
-                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
-                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
-                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
-                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
-                weighted_sq_out[f+2] = z0*z0 + z1*z1;
-
-                x0 = static_cast<double>(frame[6]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
-                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
-                x1 = static_cast<double>(frame[7]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
-                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
-                z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
-                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
-                z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
-                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
-                weighted_sq_out[f+3] = z0*z0 + z1*z1;
-
-                f += 4;
-            }
-
-            while (f < frame_count) {
-                const float* frame = samples + f * 2;
-                double x0 = static_cast<double>(frame[0]); double y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
-                sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
-                double x1 = static_cast<double>(frame[1]); double y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
-                sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
-                double z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
-                hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
-                double z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
-                hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
-                weighted_sq_out[f] = z0*z0 + z1*z1;
-                f++;
-            }
-
-            shelf_states[0].x1 = sx1_0; shelf_states[0].x2 = sx2_0; shelf_states[0].y1 = sy1_0; shelf_states[0].y2 = sy2_0;
-            shelf_states[1].x1 = sx1_1; shelf_states[1].x2 = sx2_1; shelf_states[1].y1 = sy1_1; shelf_states[1].y2 = sy2_1;
-            hp_states[0].x1 = hx1_0; hp_states[0].x2 = hx2_0; hp_states[0].y1 = hy1_0; hp_states[0].y2 = hy2_0;
-            hp_states[1].x1 = hx1_1; hp_states[1].x2 = hx2_1; hp_states[1].y1 = hy1_1; hp_states[1].y2 = hy2_1;
+            process_frames_batch_stereo(samples, frame_count, weighted_sq_out);
         } else {
-            for (size_t f = 0; f < frame_count; ++f) {
-                weighted_sq_out[f] = process_frame(samples + f * channels);
-            }
+            process_frames_batch_generic(samples, frame_count, weighted_sq_out);
         }
     }
 
@@ -629,7 +560,252 @@ public:
             high_pass.reset(hp_states[ch]);
         }
     }
+
+private:
+    void process_frames_batch_stereo(const float* samples, size_t frame_count,
+                                     double* weighted_sq_out) {
+        const double w0 = high_shelf.b0, w1 = high_shelf.b1, w2 = high_shelf.b2;
+        const double w3 = high_shelf.a1, w4 = high_shelf.a2;
+        const double h0 = high_pass.b0, h1 = high_pass.b1, h2 = high_pass.b2;
+        const double h3 = high_pass.a1, h4 = high_pass.a2;
+
+        double sx1_0 = shelf_states[0].x1, sx2_0 = shelf_states[0].x2, sy1_0 = shelf_states[0].y1, sy2_0 = shelf_states[0].y2;
+        double sx1_1 = shelf_states[1].x1, sx2_1 = shelf_states[1].x2, sy1_1 = shelf_states[1].y1, sy2_1 = shelf_states[1].y2;
+        double hx1_0 = hp_states[0].x1, hx2_0 = hp_states[0].x2, hy1_0 = hp_states[0].y1, hy2_0 = hp_states[0].y2;
+        double hx1_1 = hp_states[1].x1, hx2_1 = hp_states[1].x2, hy1_1 = hp_states[1].y1, hy2_1 = hp_states[1].y2;
+
+        size_t f = 0;
+        while (f + 4 <= frame_count) {
+            const float* frame = samples + f * 2;
+            double x0, y0, x1, y1, z0, z1;
+
+            x0 = static_cast<double>(frame[0]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+            sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+            x1 = static_cast<double>(frame[1]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+            sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+            z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+            hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+            z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+            hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+            weighted_sq_out[f] = z0*z0 + z1*z1;
+
+            x0 = static_cast<double>(frame[2]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+            sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+            x1 = static_cast<double>(frame[3]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+            sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+            z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+            hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+            z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+            hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+            weighted_sq_out[f+1] = z0*z0 + z1*z1;
+
+            x0 = static_cast<double>(frame[4]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+            sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+            x1 = static_cast<double>(frame[5]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+            sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+            z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+            hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+            z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+            hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+            weighted_sq_out[f+2] = z0*z0 + z1*z1;
+
+            x0 = static_cast<double>(frame[6]); y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+            sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+            x1 = static_cast<double>(frame[7]); y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+            sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+            z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+            hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+            z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+            hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+            weighted_sq_out[f+3] = z0*z0 + z1*z1;
+
+            f += 4;
+        }
+
+        while (f < frame_count) {
+            const float* frame = samples + f * 2;
+            double x0 = static_cast<double>(frame[0]); double y0 = denormalize(w0*x0 + w1*sx1_0 + w2*sx2_0 - w3*sy1_0 - w4*sy2_0);
+            sx2_0=sx1_0; sx1_0=x0; sy2_0=sy1_0; sy1_0=y0;
+            double x1 = static_cast<double>(frame[1]); double y1 = denormalize(w0*x1 + w1*sx1_1 + w2*sx2_1 - w3*sy1_1 - w4*sy2_1);
+            sx2_1=sx1_1; sx1_1=x1; sy2_1=sy1_1; sy1_1=y1;
+            double z0 = denormalize(h0*y0 + h1*hx1_0 + h2*hx2_0 - h3*hy1_0 - h4*hy2_0);
+            hx2_0=hx1_0; hx1_0=y0; hy2_0=hy1_0; hy1_0=z0;
+            double z1 = denormalize(h0*y1 + h1*hx1_1 + h2*hx2_1 - h3*hy1_1 - h4*hy2_1);
+            hx2_1=hx1_1; hx1_1=y1; hy2_1=hy1_1; hy1_1=z1;
+            weighted_sq_out[f] = z0*z0 + z1*z1;
+            f++;
+        }
+
+        shelf_states[0].x1 = sx1_0; shelf_states[0].x2 = sx2_0; shelf_states[0].y1 = sy1_0; shelf_states[0].y2 = sy2_0;
+        shelf_states[1].x1 = sx1_1; shelf_states[1].x2 = sx2_1; shelf_states[1].y1 = sy1_1; shelf_states[1].y2 = sy2_1;
+        hp_states[0].x1 = hx1_0; hp_states[0].x2 = hx2_0; hp_states[0].y1 = hy1_0; hp_states[0].y2 = hy2_0;
+        hp_states[1].x1 = hx1_1; hp_states[1].x2 = hx2_1; hp_states[1].y1 = hy1_1; hp_states[1].y2 = hy2_1;
+    }
+
+    // Generic N-channel kernel: channel-outer loop so the filter state lives
+    // in registers across the whole chunk. Channel contributions are added
+    // in channel order (same summation order as process_frame).
+    void process_frames_batch_generic(const float* samples, size_t frame_count,
+                                      double* weighted_sq_out) {
+        const double w0 = high_shelf.b0, w1 = high_shelf.b1, w2 = high_shelf.b2;
+        const double w3 = high_shelf.a1, w4 = high_shelf.a2;
+        const double h0 = high_pass.b0, h1 = high_pass.b1, h2 = high_pass.b2;
+        const double h3 = high_pass.a1, h4 = high_pass.a2;
+        const int nch = channels;
+
+        std::memset(weighted_sq_out, 0, frame_count * sizeof(double));
+
+        for (int ch = 0; ch < nch; ++ch) {
+            const double weight = channel_weights[ch];
+            if (weight == 0.0) continue;
+
+            double sx1 = shelf_states[ch].x1, sx2 = shelf_states[ch].x2;
+            double sy1 = shelf_states[ch].y1, sy2 = shelf_states[ch].y2;
+            double hx1 = hp_states[ch].x1, hx2 = hp_states[ch].x2;
+            double hy1 = hp_states[ch].y1, hy2 = hp_states[ch].y2;
+
+            const float* src = samples + ch;
+            for (size_t f = 0; f < frame_count; ++f) {
+                double x = static_cast<double>(src[f * nch]);
+                double y = denormalize(w0*x + w1*sx1 + w2*sx2 - w3*sy1 - w4*sy2);
+                sx2 = sx1; sx1 = x; sy2 = sy1; sy1 = y;
+                double z = denormalize(h0*y + h1*hx1 + h2*hx2 - h3*hy1 - h4*hy2);
+                hx2 = hx1; hx1 = y; hy2 = hy1; hy1 = z;
+                weighted_sq_out[f] += weight * z * z;
+            }
+
+            shelf_states[ch].x1 = sx1; shelf_states[ch].x2 = sx2;
+            shelf_states[ch].y1 = sy1; shelf_states[ch].y2 = sy2;
+            hp_states[ch].x1 = hx1; hp_states[ch].x2 = hx2;
+            hp_states[ch].y1 = hy1; hp_states[ch].y2 = hy2;
+        }
+    }
 };
+
+// ============================================================================
+// SOX-compatible RMS EMA state (chunk-batched, recurrence kept in registers)
+// ============================================================================
+
+namespace {
+
+struct RmsChannelState {
+    double avg_sigma_x2 = 0.0;
+    double max_sigma_x2 = 0.0;
+    double min_sigma_x2 = std::numeric_limits<double>::max();
+    double sum_sq = 0.0;
+};
+
+class RmsBatch {
+public:
+    RmsBatch(int channels, double sample_rate, double window_ms)
+        : channels_(channels), states_(channels) {
+        const double time_constant = window_ms / 1000.0;
+        mult_ = std::exp(-1.0 / (time_constant * sample_rate));
+        one_minus_mult_ = 1.0 - mult_;
+        tc_samples_ = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
+    }
+
+    uint64_t tc_samples() const { return tc_samples_; }
+
+    // Process `frames` interleaved frames whose first frame has measurement
+    // index `start_index` (frame index within the measured region). Min/max
+    // tracking begins at index >= tc_samples (SOX settling behavior).
+    void process(const float* samples, size_t frames, uint64_t start_index) {
+        // Split at the settling boundary so the inner loops are branch-free.
+        size_t pre = 0;
+        if (start_index < tc_samples_) {
+            uint64_t remaining = tc_samples_ - start_index;
+            pre = static_cast<size_t>(
+                std::min<uint64_t>(remaining, static_cast<uint64_t>(frames)));
+        }
+
+        const int nch = channels_;
+        for (int ch = 0; ch < nch; ++ch) {
+            RmsChannelState& st = states_[ch];
+            double avg = st.avg_sigma_x2;
+            double mx = st.max_sigma_x2;
+            double mn = st.min_sigma_x2;
+            double ssq = st.sum_sq;
+            const float* src = samples + ch;
+
+            size_t f = 0;
+            for (; f < pre; ++f) {
+                double s = static_cast<double>(src[f * nch]);
+                double sq = s * s;
+                ssq += sq;
+                avg = avg * mult_ + one_minus_mult_ * sq;
+            }
+            for (; f < frames; ++f) {
+                double s = static_cast<double>(src[f * nch]);
+                double sq = s * s;
+                ssq += sq;
+                avg = avg * mult_ + one_minus_mult_ * sq;
+                if (avg > mx) mx = avg;
+                if (avg < mn) mn = avg;
+            }
+
+            st.avg_sigma_x2 = avg;
+            st.max_sigma_x2 = mx;
+            st.min_sigma_x2 = mn;
+            st.sum_sq = ssq;
+        }
+    }
+
+    // SOX behavior for inputs shorter than the settling time: use the overall
+    // average power as both peak and trough.
+    void finalize(uint64_t measured_frames) {
+        if (measured_frames > 0 && measured_frames < tc_samples_) {
+            for (int ch = 0; ch < channels_; ++ch) {
+                double avg_power = states_[ch].sum_sq / static_cast<double>(measured_frames);
+                states_[ch].max_sigma_x2 = avg_power;
+                states_[ch].min_sigma_x2 = avg_power;
+            }
+        }
+    }
+
+    void fill_results(uint64_t measured_frames, double& rms_min, double& rms_max,
+                      double& rms_average) const {
+        rms_min = -96.0;
+        rms_max = -96.0;
+        rms_average = -96.0;
+
+        double total_sum_sq = 0.0;
+        for (int ch = 0; ch < channels_; ++ch) total_sum_sq += states_[ch].sum_sq;
+
+        const uint64_t total_sample_count =
+            measured_frames * static_cast<uint64_t>(channels_);
+        if (total_sample_count > 0 && total_sum_sq > 0.0) {
+            double avg_rms = std::sqrt(total_sum_sq / static_cast<double>(total_sample_count));
+            rms_average = 20.0 * std::log10(avg_rms);
+        }
+
+        double overall_max = 0.0;
+        for (int ch = 0; ch < channels_; ++ch) {
+            if (states_[ch].max_sigma_x2 > overall_max) overall_max = states_[ch].max_sigma_x2;
+        }
+        if (overall_max > 0.0) {
+            rms_max = 20.0 * std::log10(std::sqrt(overall_max));
+        }
+
+        double overall_min = std::numeric_limits<double>::max();
+        for (int ch = 0; ch < channels_; ++ch) {
+            if (states_[ch].min_sigma_x2 < overall_min) overall_min = states_[ch].min_sigma_x2;
+        }
+        if (overall_min > 0.0 && overall_min < std::numeric_limits<double>::max()) {
+            double min_db = 20.0 * std::log10(std::sqrt(overall_min));
+            rms_min = std::isinf(min_db) ? -96.0 : min_db;
+        }
+    }
+
+private:
+    int channels_;
+    double mult_;
+    double one_minus_mult_;
+    uint64_t tc_samples_;
+    std::vector<RmsChannelState> states_;
+};
+
+}  // namespace
 
 // ============================================================================
 // Public API: LoudnessMeter::calc_high_shelf / calc_high_pass
@@ -655,8 +831,8 @@ LoudnessMeter::BiquadCoeffs LoudnessMeter::calc_high_pass(double sample_rate) {
 // Short-term block requires 3000ms, so we loop audio to at least 4 seconds
 // to ensure proper BS.1770-4 measurement. For looped buffers we add one
 // extra loop at the front to be used as a K-weighting filter warmup; the
-// caller is expected to feed those frames through the filter without
-// registering blocks, so that the measured region runs on a settled IIR.
+// caller feeds those frames through the filter without registering blocks,
+// so that the measured region runs on a settled IIR.
 // ============================================================================
 
 struct LoudnessBuffer {
@@ -693,6 +869,37 @@ static LoudnessBuffer prepare_loudness_buffer(const std::vector<float>& samples,
 }
 
 // ============================================================================
+// Shared result assembly (fallback chains for edge cases)
+// ============================================================================
+
+static void finalize_loudness_result(LoudnessMeter::Result& r,
+                                     const BlockAggregator& momentary,
+                                     const BlockAggregator& shortterm,
+                                     const LoudnessHistogram& momentary_histogram,
+                                     const LoudnessHistogram& shortterm_histogram) {
+    r.integrated = momentary_histogram.get_integrated_loudness();
+    r.momentary_max = momentary.get_max_loudness();
+    r.shortterm_max = shortterm.get_max_loudness();
+    r.range = shortterm_histogram.get_loudness_range();
+
+    if (std::isinf(r.momentary_max) && momentary_histogram.total_count > 0) {
+        r.momentary_max = momentary_histogram.get_max_loudness();
+    }
+    if (std::isinf(r.shortterm_max) && shortterm_histogram.total_count > 0) {
+        r.shortterm_max = shortterm_histogram.get_max_loudness();
+    }
+    if (std::isinf(r.momentary_max)) {
+        r.momentary_max = r.integrated;
+    }
+    if (std::isinf(r.shortterm_max)) {
+        r.shortterm_max = r.momentary_max;
+    }
+    if (r.range <= 0.0 && shortterm_histogram.total_count < 2) {
+        r.range = 0.0;
+    }
+}
+
+// ============================================================================
 // Public API: LoudnessMeter::measure
 // ============================================================================
 
@@ -709,15 +916,15 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
         return result;
     }
 
+    DenormalGuard denormal_guard;
+
     const double sample_rate = static_cast<double>(audio.sample_rate);
     const int channels = audio.channels;
 
     // Track sample peak from ORIGINAL audio (pre-loop, pre-filter)
-    // Use SIMD-optimized peak detection for all interleaved samples
     const size_t total_samples = audio.total_frames * static_cast<size_t>(channels);
     float sample_peak_linear = simd::find_peak_abs(audio.samples.data(), total_samples);
 
-    // Convert sample peak to dBFS
     if (sample_peak_linear > 0.0f) {
         result.sample_peak = 20.0 * std::log10(static_cast<double>(sample_peak_linear));
     } else {
@@ -732,34 +939,20 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
     const size_t total_frames = buf.total_frames;
     const size_t warmup_frames = buf.warmup_frames;
 
-    // Initialize K-weighting filter
     KWeightingFilter kfilter(sample_rate, channels);
-
-    // Initialize block aggregators
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
-
-    // Histogram for integrated loudness (uses momentary blocks)
     LoudnessHistogram momentary_histogram;
-
-    // Separate histogram for LRA (uses short-term blocks)
     LoudnessHistogram shortterm_histogram;
 
-    constexpr size_t BATCH_SIZE = 4096;
-    std::vector<double> weighted_sq_batch(BATCH_SIZE);
+    std::vector<double> weighted_sq_batch(BATCH_FRAMES);
 
     size_t frame = 0;
     while (frame < total_frames) {
-        size_t batch_frames = std::min(BATCH_SIZE, total_frames - frame);
+        size_t batch_frames = std::min(BATCH_FRAMES, total_frames - frame);
         const float* batch_samples = samples + frame * channels;
 
-        if (channels == 2) {
-            kfilter.process_frames_batch(batch_samples, batch_frames, weighted_sq_batch.data());
-        } else {
-            for (size_t i = 0; i < batch_frames; ++i) {
-                weighted_sq_batch[i] = kfilter.process_frame(batch_samples + i * channels);
-            }
-        }
+        kfilter.process_frames_batch(batch_samples, batch_frames, weighted_sq_batch.data());
 
         size_t start = 0;
         if (frame < warmup_frames) {
@@ -767,46 +960,17 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
             start = std::min(batch_frames, warmup_frames - frame);
         }
         if (start < batch_frames) {
-            momentary.add_samples(weighted_sq_batch.data() + start, batch_frames - start,
-                                  momentary_histogram);
-            shortterm.add_samples(weighted_sq_batch.data() + start, batch_frames - start,
-                                  shortterm_histogram);
+            momentary.add_batch(weighted_sq_batch.data() + start, batch_frames - start,
+                                momentary_histogram);
+            shortterm.add_batch(weighted_sq_batch.data() + start, batch_frames - start,
+                                shortterm_histogram);
         }
 
         frame += batch_frames;
     }
 
-    // Get results from histograms and aggregators
-    result.integrated = momentary_histogram.get_integrated_loudness();
-    result.momentary_max = momentary.get_max_loudness();
-    result.shortterm_max = shortterm.get_max_loudness();
-
-    // LRA is calculated from short-term blocks (per EBU R 128)
-    result.range = shortterm_histogram.get_loudness_range();
-
-    // Handle edge cases
-    if (std::isinf(result.momentary_max) && momentary_histogram.total_count > 0) {
-        result.momentary_max = momentary_histogram.get_max_loudness();
-    }
-
-    if (std::isinf(result.shortterm_max) && shortterm_histogram.total_count > 0) {
-        result.shortterm_max = shortterm_histogram.get_max_loudness();
-    }
-
-    // Fallback for edge cases
-    if (std::isinf(result.momentary_max)) {
-        result.momentary_max = result.integrated;
-    }
-
-    if (std::isinf(result.shortterm_max)) {
-        result.shortterm_max = result.momentary_max;
-    }
-
-    // If LRA is zero or negative and we don't have enough short-term blocks
-    if (result.range <= 0.0 && shortterm_histogram.total_count < 2) {
-        result.range = 0.0;
-    }
-
+    finalize_loudness_result(result, momentary, shortterm,
+                             momentary_histogram, shortterm_histogram);
     return result;
 }
 
@@ -814,7 +978,9 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
 // Public API: LoudnessMeter::measure_with_rms
 // ============================================================================
 
-LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& audio, double window_ms) {
+LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& audio,
+                                                              double window_ms,
+                                                              double known_sample_peak_linear) {
     ExtendedResult out = {};
     out.loudness = {
         SILENCE_THRESHOLD,
@@ -826,20 +992,27 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     out.rms_min = -96.0;
     out.rms_max = -96.0;
     out.rms_average = -96.0;
+    out.true_peak = -std::numeric_limits<double>::infinity();
 
     if (audio.samples.empty() || audio.channels == 0 || audio.sample_rate == 0) {
         return out;
     }
 
+    DenormalGuard denormal_guard;
+
     const double sample_rate = static_cast<double>(audio.sample_rate);
     const int channels = audio.channels;
     const size_t original_frames = audio.total_frames;
 
-    // RMS parameters (SOX compatible)
-    const double time_constant = window_ms / 1000.0;
-    const double mult = std::exp(-1.0 / (time_constant * sample_rate));
-    const double one_minus_mult = 1.0 - mult;
-    const uint64_t tc_samples = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
+    // Sample peak from original audio only (reuse caller's scan if provided)
+    double sample_peak_linear = known_sample_peak_linear;
+    if (sample_peak_linear < 0.0) {
+        sample_peak_linear = static_cast<double>(simd::find_peak_abs(
+            audio.samples.data(), original_frames * static_cast<size_t>(channels)));
+    }
+    if (sample_peak_linear > 0.0) {
+        out.loudness.sample_peak = 20.0 * std::log10(sample_peak_linear);
+    }
 
     // Loop short audio to minimum length for accurate BS.1770-4 measurement
     std::vector<float> looped_samples;
@@ -848,151 +1021,61 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     const float* samples = buf.samples;
     const size_t total_frames = buf.total_frames;
     const size_t warmup_frames = buf.warmup_frames;
-    const size_t rms_end = warmup_frames + original_frames;  // RMS is computed only over the real audio window
+    const size_t rms_end = warmup_frames + original_frames;  // RMS covers the real audio window
 
-    // Initialize K-weighting filter
     KWeightingFilter kfilter(sample_rate, channels);
-
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
     LoudnessHistogram momentary_histogram;
     LoudnessHistogram shortterm_histogram;
+    RmsBatch rms(channels, sample_rate, window_ms);
 
-    float sample_peak_linear = 0.0f;
+    std::vector<double> weighted_sq_batch(BATCH_FRAMES);
 
-    std::vector<double> avg_sigma_x2(channels, 0.0);
-    std::vector<double> max_sigma_x2(channels, 0.0);
-    std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
-    std::vector<double> sum_sq(channels, 0.0);
+    size_t frame = 0;
+    while (frame < total_frames) {
+        size_t batch_frames = std::min(BATCH_FRAMES, total_frames - frame);
+        const float* batch_samples = samples + frame * channels;
 
-    // Sample peak from original audio only
-    sample_peak_linear = simd::find_peak_abs(audio.samples.data(),
-                                             original_frames * static_cast<size_t>(channels));
-
-    for (size_t frame = 0; frame < total_frames; ++frame) {
-        const float* frame_samples = samples + frame * channels;
-        double weighted_sq = kfilter.process_frame(frame_samples);
-
-        // RMS: compute only over the original window
-        if (frame >= warmup_frames && frame < rms_end) {
-            size_t orig_idx = frame - warmup_frames;
-            for (int ch = 0; ch < channels; ++ch) {
-                float s = frame_samples[ch];
-                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
-                sum_sq[ch] += sample_sq;
-                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
-
-                if (orig_idx >= tc_samples) {
-                    if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
-                        max_sigma_x2[ch] = avg_sigma_x2[ch];
-                    }
-                    if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
-                        min_sigma_x2[ch] = avg_sigma_x2[ch];
-                    }
-                }
-            }
-        }
+        kfilter.process_frames_batch(batch_samples, batch_frames, weighted_sq_batch.data());
 
         // Loudness: skip warmup region
-        if (frame >= warmup_frames) {
-            double block_power;
-            if (momentary.add_sample(weighted_sq, block_power)) {
-                momentary_histogram.add_block(block_power);
-            }
-            if (shortterm.add_sample(weighted_sq, block_power)) {
-                shortterm_histogram.add_block(block_power);
-            }
+        size_t start = 0;
+        if (frame < warmup_frames) {
+            start = std::min(batch_frames, warmup_frames - frame);
         }
-    }
-
-    // Loudness results
-    out.loudness.integrated = momentary_histogram.get_integrated_loudness();
-    out.loudness.momentary_max = momentary.get_max_loudness();
-    out.loudness.shortterm_max = shortterm.get_max_loudness();
-    out.loudness.range = shortterm_histogram.get_loudness_range();
-
-    if (sample_peak_linear > 0.0f) {
-        out.loudness.sample_peak = 20.0 * std::log10(static_cast<double>(sample_peak_linear));
-    } else {
-        out.loudness.sample_peak = -std::numeric_limits<double>::infinity();
-    }
-
-    if (std::isinf(out.loudness.momentary_max) && momentary_histogram.total_count > 0) {
-        out.loudness.momentary_max = momentary_histogram.get_max_loudness();
-    }
-
-    if (std::isinf(out.loudness.shortterm_max) && shortterm_histogram.total_count > 0) {
-        out.loudness.shortterm_max = shortterm_histogram.get_max_loudness();
-    }
-
-    if (std::isinf(out.loudness.momentary_max)) {
-        out.loudness.momentary_max = out.loudness.integrated;
-    }
-
-    if (std::isinf(out.loudness.shortterm_max)) {
-        out.loudness.shortterm_max = out.loudness.momentary_max;
-    }
-
-    if (out.loudness.range <= 0.0 && shortterm_histogram.total_count < 2) {
-        out.loudness.range = 0.0;
-    }
-
-    // RMS results (SOX behavior)
-    if (original_frames < static_cast<size_t>(tc_samples)) {
-        for (int ch = 0; ch < channels; ++ch) {
-            double avg_power = sum_sq[ch] / static_cast<double>(original_frames);
-            max_sigma_x2[ch] = avg_power;
-            min_sigma_x2[ch] = avg_power;
+        if (start < batch_frames) {
+            momentary.add_batch(weighted_sq_batch.data() + start, batch_frames - start,
+                                momentary_histogram);
+            shortterm.add_batch(weighted_sq_batch.data() + start, batch_frames - start,
+                                shortterm_histogram);
         }
-    }
 
-    double total_sum_sq = 0.0;
-    const uint64_t total_sample_count =
-        static_cast<uint64_t>(original_frames) * static_cast<uint64_t>(channels);
-
-    for (int ch = 0; ch < channels; ++ch) {
-        total_sum_sq += sum_sq[ch];
-    }
-
-    if (total_sample_count > 0 && total_sum_sq > 0.0) {
-        double avg_rms = std::sqrt(total_sum_sq / static_cast<double>(total_sample_count));
-        out.rms_average = 20.0 * std::log10(avg_rms);
-    }
-
-    double overall_max_sigma_x2 = 0.0;
-    for (int ch = 0; ch < channels; ++ch) {
-        if (max_sigma_x2[ch] > overall_max_sigma_x2) {
-            overall_max_sigma_x2 = max_sigma_x2[ch];
+        // RMS: only over [warmup_frames, rms_end)
+        size_t rms_lo = std::max(frame, warmup_frames);
+        size_t rms_hi = std::min(frame + batch_frames, rms_end);
+        if (rms_lo < rms_hi) {
+            rms.process(samples + rms_lo * channels, rms_hi - rms_lo,
+                        static_cast<uint64_t>(rms_lo - warmup_frames));
         }
-    }
-    if (overall_max_sigma_x2 > 0.0) {
-        double max_rms = std::sqrt(overall_max_sigma_x2);
-        out.rms_max = 20.0 * std::log10(max_rms);
+
+        frame += batch_frames;
     }
 
-    double overall_min_sigma_x2 = std::numeric_limits<double>::max();
-    for (int ch = 0; ch < channels; ++ch) {
-        if (min_sigma_x2[ch] < overall_min_sigma_x2) {
-            overall_min_sigma_x2 = min_sigma_x2[ch];
-        }
-    }
-    if (overall_min_sigma_x2 > 0.0 && overall_min_sigma_x2 < std::numeric_limits<double>::max()) {
-        double min_rms = std::sqrt(overall_min_sigma_x2);
-        double min_db = 20.0 * std::log10(min_rms);
-        if (std::isinf(min_db)) {
-            out.rms_min = -96.0;
-        } else {
-            out.rms_min = min_db;
-        }
-    } else {
-        out.rms_min = -96.0;
-    }
+    finalize_loudness_result(out.loudness, momentary, shortterm,
+                             momentary_histogram, shortterm_histogram);
+
+    rms.finalize(original_frames);
+    rms.fill_results(original_frames, out.rms_min, out.rms_max, out.rms_average);
 
     return out;
 }
 
 // ============================================================================
 // Public API: LoudnessMeter::measure_stream
+//
+// Single pass: loudness + RMS + sample peak + exact BS.1770-4 true peak
+// (the polyphase scanner is fully streamable).
 // ============================================================================
 
 LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream, double window_ms) {
@@ -1007,27 +1090,19 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     out.rms_min = -96.0;
     out.rms_max = -96.0;
     out.rms_average = -96.0;
+    out.true_peak = -std::numeric_limits<double>::infinity();
 
     const auto info = stream.info;
     if (info.channels == 0 || info.sample_rate == 0) {
         return out;
     }
 
+    DenormalGuard denormal_guard;
+
     const double sample_rate = static_cast<double>(info.sample_rate);
     const int channels = info.channels;
 
-    const double time_constant = window_ms / 1000.0;
-    const double mult = std::exp(-1.0 / (time_constant * sample_rate));
-    const double one_minus_mult = 1.0 - mult;
-    const uint64_t tc_samples = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
-
     float sample_peak_linear = 0.0f;
-
-    std::vector<double> avg_sigma_x2(channels, 0.0);
-    std::vector<double> max_sigma_x2(channels, 0.0);
-    std::vector<double> min_sigma_x2(channels, std::numeric_limits<double>::max());
-    std::vector<double> sum_sq(channels, 0.0);
-
     uint64_t total_frames = 0;
 
     KWeightingFilter kfilter(sample_rate, channels);
@@ -1035,28 +1110,28 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
     LoudnessHistogram momentary_histogram;
     LoudnessHistogram shortterm_histogram;
+    RmsBatch rms(channels, sample_rate, window_ms);
+    tp_detail::TruePeakScanner truepeak(channels);
 
     constexpr double MIN_DURATION_MS = 4000.0;
     const size_t min_frames = static_cast<size_t>((MIN_DURATION_MS / 1000.0) * sample_rate);
 
-    const size_t frames_per_chunk = 4096;
+    const size_t frames_per_chunk = 65536;
     std::vector<float> chunk(frames_per_chunk * channels);
+    std::vector<double> weighted_sq_batch(BATCH_FRAMES);
     std::vector<float> short_buffer;
     size_t buffered_frames = 0;
     bool loudness_started = false;
 
     auto process_loudness_frames = [&](const float* data, size_t frames) {
-        for (size_t frame = 0; frame < frames; ++frame) {
-            const float* frame_samples = data + frame * channels;
-            double weighted_sq = kfilter.process_frame(frame_samples);
-
-            double block_power;
-            if (momentary.add_sample(weighted_sq, block_power)) {
-                momentary_histogram.add_block(block_power);
-            }
-            if (shortterm.add_sample(weighted_sq, block_power)) {
-                shortterm_histogram.add_block(block_power);
-            }
+        size_t f = 0;
+        while (f < frames) {
+            size_t batch_frames = std::min(BATCH_FRAMES, frames - f);
+            kfilter.process_frames_batch(data + f * channels, batch_frames,
+                                         weighted_sq_batch.data());
+            momentary.add_batch(weighted_sq_batch.data(), batch_frames, momentary_histogram);
+            shortterm.add_batch(weighted_sq_batch.data(), batch_frames, shortterm_histogram);
+            f += batch_frames;
         }
     };
 
@@ -1066,46 +1141,18 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
             break;
         }
 
-        float chunk_peak = simd::find_peak_abs(chunk.data(), frames_read * static_cast<size_t>(channels));
+        float chunk_peak = simd::find_peak_abs(chunk.data(),
+                                               frames_read * static_cast<size_t>(channels));
         if (chunk_peak > sample_peak_linear) {
             sample_peak_linear = chunk_peak;
         }
 
-        uint64_t frames_seen = total_frames;
-        size_t pre_frames = 0;
-        if (frames_seen < tc_samples) {
-            uint64_t remaining = tc_samples - frames_seen;
-            pre_frames = static_cast<size_t>(
-                std::min<uint64_t>(static_cast<uint64_t>(frames_read), remaining));
-        }
+        // True peak: single streaming pass, exact 4x oversampling
+        truepeak.seed_peak(static_cast<double>(chunk_peak));
+        truepeak.process(chunk.data(), frames_read);
 
-        const float* frame_samples = chunk.data();
-        for (size_t frame = 0; frame < pre_frames; ++frame) {
-            for (int ch = 0; ch < channels; ++ch) {
-                float s = frame_samples[ch];
-                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
-                sum_sq[ch] += sample_sq;
-                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
-            }
-            frame_samples += channels;
-        }
-
-        for (size_t frame = pre_frames; frame < frames_read; ++frame) {
-            for (int ch = 0; ch < channels; ++ch) {
-                float s = frame_samples[ch];
-                double sample_sq = static_cast<double>(s) * static_cast<double>(s);
-                sum_sq[ch] += sample_sq;
-                avg_sigma_x2[ch] = avg_sigma_x2[ch] * mult + one_minus_mult * sample_sq;
-
-                if (avg_sigma_x2[ch] > max_sigma_x2[ch]) {
-                    max_sigma_x2[ch] = avg_sigma_x2[ch];
-                }
-                if (avg_sigma_x2[ch] < min_sigma_x2[ch]) {
-                    min_sigma_x2[ch] = avg_sigma_x2[ch];
-                }
-            }
-            frame_samples += channels;
-        }
+        // RMS (measurement index = global frame index)
+        rms.process(chunk.data(), frames_read, total_frames);
 
         total_frames += frames_read;
 
@@ -1124,9 +1171,12 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
             if (buffered_frames >= min_frames) {
                 process_loudness_frames(short_buffer.data(), buffered_frames);
                 loudness_started = true;
+                short_buffer.clear();
+                short_buffer.shrink_to_fit();
 
                 if (frames_read > to_buffer) {
-                    process_loudness_frames(chunk.data() + (to_buffer * channels), frames_read - to_buffer);
+                    process_loudness_frames(chunk.data() + (to_buffer * channels),
+                                            frames_read - to_buffer);
                 }
             }
         } else {
@@ -1137,9 +1187,12 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     if (!loudness_started && buffered_frames > 0) {
         size_t loops_for_min = (min_frames + buffered_frames - 1) / buffered_frames;
         // Warmup loop: pass through K-weighting filter, do not register blocks
-        for (size_t f = 0; f < buffered_frames; ++f) {
-            const float* fs = short_buffer.data() + f * channels;
-            kfilter.process_frame(fs);
+        size_t f = 0;
+        while (f < buffered_frames) {
+            size_t batch_frames = std::min(BATCH_FRAMES, buffered_frames - f);
+            kfilter.process_frames_batch(short_buffer.data() + f * channels, batch_frames,
+                                         weighted_sq_batch.data());
+            f += batch_frames;
         }
         // Measurement loops on a settled filter
         for (size_t loop = 0; loop < loops_for_min; ++loop) {
@@ -1147,10 +1200,8 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
         }
     }
 
-    out.loudness.integrated = momentary_histogram.get_integrated_loudness();
-    out.loudness.momentary_max = momentary.get_max_loudness();
-    out.loudness.shortterm_max = shortterm.get_max_loudness();
-    out.loudness.range = shortterm_histogram.get_loudness_range();
+    finalize_loudness_result(out.loudness, momentary, shortterm,
+                             momentary_histogram, shortterm_histogram);
 
     if (sample_peak_linear > 0.0f) {
         out.loudness.sample_peak = 20.0 * std::log10(static_cast<double>(sample_peak_linear));
@@ -1158,75 +1209,14 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
         out.loudness.sample_peak = -std::numeric_limits<double>::infinity();
     }
 
-    if (std::isinf(out.loudness.momentary_max) && momentary_histogram.total_count > 0) {
-        out.loudness.momentary_max = momentary_histogram.get_max_loudness();
+    truepeak.flush();
+    double tp_linear = truepeak.peak_linear();
+    if (tp_linear > 0.0) {
+        out.true_peak = 20.0 * std::log10(tp_linear);
     }
 
-    if (std::isinf(out.loudness.shortterm_max) && shortterm_histogram.total_count > 0) {
-        out.loudness.shortterm_max = shortterm_histogram.get_max_loudness();
-    }
-
-    if (std::isinf(out.loudness.momentary_max)) {
-        out.loudness.momentary_max = out.loudness.integrated;
-    }
-
-    if (std::isinf(out.loudness.shortterm_max)) {
-        out.loudness.shortterm_max = out.loudness.momentary_max;
-    }
-
-    if (out.loudness.range <= 0.0 && shortterm_histogram.total_count < 2) {
-        out.loudness.range = 0.0;
-    }
-
-    if (total_frames < tc_samples && total_frames > 0) {
-        for (int ch = 0; ch < channels; ++ch) {
-            double avg_power = sum_sq[ch] / static_cast<double>(total_frames);
-            max_sigma_x2[ch] = avg_power;
-            min_sigma_x2[ch] = avg_power;
-        }
-    }
-
-    double total_sum_sq = 0.0;
-    for (int ch = 0; ch < channels; ++ch) {
-        total_sum_sq += sum_sq[ch];
-    }
-
-    const uint64_t total_sample_count =
-        total_frames * static_cast<uint64_t>(channels);
-
-    if (total_sample_count > 0 && total_sum_sq > 0.0) {
-        double avg_rms = std::sqrt(total_sum_sq / static_cast<double>(total_sample_count));
-        out.rms_average = 20.0 * std::log10(avg_rms);
-    }
-
-    double overall_max_sigma_x2 = 0.0;
-    for (int ch = 0; ch < channels; ++ch) {
-        if (max_sigma_x2[ch] > overall_max_sigma_x2) {
-            overall_max_sigma_x2 = max_sigma_x2[ch];
-        }
-    }
-    if (overall_max_sigma_x2 > 0.0) {
-        double max_rms = std::sqrt(overall_max_sigma_x2);
-        out.rms_max = 20.0 * std::log10(max_rms);
-    }
-
-    double overall_min_sigma_x2 = std::numeric_limits<double>::max();
-    for (int ch = 0; ch < channels; ++ch) {
-        if (min_sigma_x2[ch] < overall_min_sigma_x2) {
-            overall_min_sigma_x2 = min_sigma_x2[ch];
-        }
-    }
-    if (overall_min_sigma_x2 > 0.0 && overall_min_sigma_x2 < std::numeric_limits<double>::max()) {
-        double min_rms = std::sqrt(overall_min_sigma_x2);
-        double min_db = 20.0 * std::log10(min_rms);
-        if (std::isinf(min_db)) {
-            out.rms_min = -96.0;
-        } else {
-            out.rms_min = min_db;
-        }
-    } else {
-        out.rms_min = -96.0;
-    }
+    rms.finalize(total_frames);
+    rms.fill_results(total_frames, out.rms_min, out.rms_max, out.rms_average);
 
     return out;
 }
@@ -1250,6 +1240,16 @@ std::string format_duration(double seconds) {
     double secs = std::fmod(seconds, 60);
     int whole_secs = static_cast<int>(secs);
     int millis = static_cast<int>((secs - whole_secs) * 1000 + 0.5);
+    if (millis >= 1000) {  // carry when fractional part rounds up to 1000ms
+        millis -= 1000;
+        if (++whole_secs >= 60) {
+            whole_secs -= 60;
+            if (++mins >= 60) {
+                mins -= 60;
+                ++hours;
+            }
+        }
+    }
 
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", hours, mins, whole_secs, millis);

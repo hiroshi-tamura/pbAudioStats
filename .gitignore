@@ -31,9 +31,21 @@ Thumbs.db
 *.tmp
 *.log
 
+# Local benchmark/verification data (generated, never push)
+bench_data/
+
 # Local-only files (never push)
 HANDOVER.md
 HANDOVER.md.bak
 HANDOVER.md.pbterm-prev.bak
 pbTermLog.txt
 deploy_and_build.sh
+# pbhandover
+/HANDOVER.md
+.pbhandover/
+.claude/settings.local.json
+.codex/hooks.json
+build/
+
+# Local-only verification harness (contains local paths)
+tools/

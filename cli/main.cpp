@@ -4,6 +4,12 @@
  *
  * Supports: WAV, AIFF, MP3
  * Features: BS.1770-4 Loudness, True Peak, RMS, Normalization
+ *
+ * Entry point note: main() lives in cpu_check.cpp (compiled without AVX2)
+ * and calls app_main() here after verifying CPU support.
+ *
+ * All paths are handled as UTF-8 internally; on Windows the wide command
+ * line is converted explicitly so Japanese / non-ANSI filenames work.
  */
 
 #include "pbAudioStats.h"
@@ -11,18 +17,23 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace pb_audio;
@@ -34,6 +45,50 @@ using namespace pb_audio;
 static std::atomic<bool> g_cancelled{false};
 extern "C" void cli_signal_handler(int) {
     g_cancelled.store(true, std::memory_order_relaxed);
+}
+
+// ============================================================================
+// UTF-8 path helpers
+// ============================================================================
+
+static fs::path utf8_path(const std::string& utf8) {
+#if defined(_WIN32)
+    return fs::u8path(utf8);
+#else
+    return fs::path(utf8);
+#endif
+}
+
+static std::string path_to_utf8(const fs::path& p) {
+#if defined(_WIN32)
+    return p.u8string();
+#else
+    return p.string();
+#endif
+}
+
+// Convert the native command line to UTF-8 argument strings.
+static std::vector<std::string> get_utf8_args(int argc, char* argv[]) {
+#if defined(_WIN32)
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv) {
+        std::vector<std::string> args;
+        args.reserve(static_cast<size_t>(wargc));
+        for (int i = 0; i < wargc; ++i) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+            std::string s;
+            if (len > 1) {
+                s.resize(static_cast<size_t>(len) - 1);
+                WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), len, nullptr, nullptr);
+            }
+            args.push_back(std::move(s));
+        }
+        LocalFree(wargv);
+        return args;
+    }
+#endif
+    return std::vector<std::string>(argv, argv + argc);
 }
 
 // ============================================================================
@@ -136,10 +191,12 @@ static void print_usage() {
     std::cout << "  -norm-m:<value>    Normalize to Momentary Max (LUFS)\n";
     std::cout << "  -norm-rn:<value>   Normalize to RMS Min (dB)\n";
     std::cout << "  -norm-rm:<value>   Normalize to RMS Max (dB)\n";
-    std::cout << "  -norm-ra:<value>   Normalize to RMS Average (dB)\n\n";
+    std::cout << "  -norm-ra:<value>   Normalize to RMS Average (dB)\n";
+    std::cout << "  Note: MP3 cannot be written; normalizing an MP3 requires a\n";
+    std::cout << "        .wav or .aiff output path.\n\n";
 
     std::cout << "Other Options:\n";
-    std::cout << "  -j<N>  Number of threads for parallel processing (default: auto)\n";
+    std::cout << "  -j<N>  Number of threads for parallel processing (default: all cores)\n";
     std::cout << "  -h     Show this help message\n\n";
 
     std::cout << "If [output_file] ends in .csv the analysis result is written\n";
@@ -182,11 +239,11 @@ static bool parse_norm_option(const std::string& arg, Config& config) {
     return true;
 }
 
-static bool parse_args(int argc, char* argv[], Config& config) {
+static bool parse_args(const std::vector<std::string>& args, Config& config) {
     std::vector<std::string> positional;
 
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
 
         if (arg == "-h" || arg == "--help") {
             print_usage();
@@ -223,7 +280,7 @@ static bool parse_args(int argc, char* argv[], Config& config) {
                                   << arg << ").\n";
                         return false;
                     }
-                    config.num_threads = v;
+                    config.num_threads = std::min(v, 256);
                 } catch (...) {
                     std::cerr << "Error: invalid -j value: " << arg << "\n";
                     return false;
@@ -281,7 +338,9 @@ static std::vector<FileEntry> collect_audio_entries(const std::string& path) {
     std::vector<FileEntry> entries;
 
     auto try_add = [&entries](const fs::path& p) {
-        std::string s = fs::absolute(p).string();
+        std::error_code abs_ec;
+        fs::path ap = fs::absolute(p, abs_ec);
+        std::string s = path_to_utf8(abs_ec ? p : ap);
         if (AudioReader::detect_format(s) == AudioFormat::Unknown) return;
         FileEntry e;
         e.path = std::move(s);
@@ -291,11 +350,19 @@ static std::vector<FileEntry> collect_audio_entries(const std::string& path) {
         entries.push_back(std::move(e));
     };
 
-    if (fs::is_regular_file(path)) {
-        try_add(path);
-    } else if (fs::is_directory(path)) {
-        for (const auto& entry : fs::recursive_directory_iterator(path)) {
-            if (entry.is_regular_file()) try_add(entry.path());
+    const fs::path root = utf8_path(path);
+    std::error_code ec;
+    if (fs::is_regular_file(root, ec)) {
+        try_add(root);
+    } else if (fs::is_directory(root, ec)) {
+        // error_code-based iteration: a permission-denied subdirectory or
+        // racing deletion must not throw and kill the whole batch.
+        fs::recursive_directory_iterator it(
+            root, fs::directory_options::skip_permission_denied, ec);
+        fs::recursive_directory_iterator end;
+        while (!ec && it != end) {
+            if (it->is_regular_file(ec) && !ec) try_add(it->path());
+            it.increment(ec);
         }
     }
 
@@ -383,26 +450,53 @@ static void output_stats(const Config& config, const AudioStats& stats, std::ost
 }
 
 // ============================================================================
+// Thread-count selection
+// ============================================================================
+
+static int pick_thread_count(int requested, size_t work_items, int hard_cap) {
+    int n = requested;
+    if (n <= 0) {
+        n = static_cast<int>(std::thread::hardware_concurrency());
+        if (n <= 0) n = 4;
+        if (hard_cap > 0) n = std::min(n, hard_cap);
+    }
+    // Never spawn more threads than work items.
+    if (work_items > 0) {
+        n = static_cast<int>(std::min<size_t>(static_cast<size_t>(n), work_items));
+    }
+    return std::max(1, n);
+}
+
+#if defined(_WIN32)
+static uint64_t total_physical_ram() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) return ms.ullTotalPhys;
+    return 8ull << 30;
+}
+#else
+static uint64_t total_physical_ram() {
+    return 8ull << 30;  // conservative fallback
+}
+#endif
+
+// ============================================================================
 // Parallel Analysis
 // ============================================================================
 
 static void process_files_parallel(const std::vector<FileEntry>& entries,
                                    const Config& config,
                                    std::vector<AudioStats>& results) {
-    int num_threads = config.num_threads;
-    if (num_threads <= 0) {
-        num_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-    }
-    // Cap analysis threads to avoid I/O thrashing on systems with many cores.
-    num_threads = std::min(num_threads, 8);
-
     const size_t total = entries.size();
     results.resize(total);
     if (total == 0) return;
 
-    const bool use_single_pass = total < 64;
-    const size_t print_every = (total < 64) ? std::max<size_t>(1, total)
-                                            : std::max<size_t>(1, total / 50);
+    // Analysis is CPU-bound and per-file memory is bounded (files above the
+    // 32MB streaming threshold are analyzed in a single bounded-memory pass),
+    // so use every core by default. An explicit -j is honored as-is.
+    const int num_threads = pick_thread_count(config.num_threads, total, /*hard_cap=*/0);
+
+    const size_t print_every = (total < 64) ? 1 : std::max<size_t>(1, total / 50);
 
     std::atomic<size_t> next_index{0};
     std::atomic<size_t> completed{0};
@@ -413,11 +507,19 @@ static void process_files_parallel(const std::vector<FileEntry>& entries,
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
             if (idx >= total) break;
 
-            results[idx] = analyze(entries[idx].path, use_single_pass);
+            // A single corrupt file (or an unexpected exception) must not
+            // call std::terminate and kill the entire batch.
+            try {
+                results[idx] = analyze(entries[idx].path);
+            } catch (...) {
+                results[idx] = AudioStats{};
+                results[idx].valid = false;
+                results[idx].filepath = entries[idx].path;
+            }
 
             size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
-            std::lock_guard<std::mutex> lock(progress_mutex);
             if (done == total || done % print_every == 0) {
+                std::lock_guard<std::mutex> lock(progress_mutex);
                 std::cerr << "\rProcessing: " << done << "/" << total
                           << " files..." << std::flush;
             }
@@ -429,8 +531,7 @@ static void process_files_parallel(const std::vector<FileEntry>& entries,
     for (int i = 0; i < num_threads; ++i) threads.emplace_back(worker);
     for (auto& t : threads) t.join();
 
-    std::lock_guard<std::mutex> lock(progress_mutex);
-    std::cerr << "\rProcessing: " << total << "/" << total
+    std::cerr << "\rProcessing: " << completed.load() << "/" << total
               << " files... Done!\n";
 }
 
@@ -446,9 +547,18 @@ static int process_normalize(const Config& config) {
     }
     sort_largest_first(entries);
 
-    if (entries.size() == 1) {
+    std::error_code root_ec;
+    const bool input_is_dir = fs::is_directory(utf8_path(config.input_path), root_ec);
+
+    if (!input_is_dir && entries.size() == 1) {
         const std::string& input = entries[0].path;
         std::string output = config.output_path.empty() ? input : config.output_path;
+
+        if (AudioReader::detect_format(output) == AudioFormat::MP3) {
+            std::cerr << "Error: MP3 output is not supported. Specify a .wav or "
+                         ".aiff output path when normalizing an MP3 file.\n";
+            return 1;
+        }
 
         std::cout << "Normalizing: " << input << "\n";
         std::cout << "  Target: " << config.norm_value << " dB\n";
@@ -463,25 +573,60 @@ static int process_normalize(const Config& config) {
         return 0;
     }
 
-    std::string output_dir = config.output_path.empty()
-        ? fs::path(config.input_path).string()
-        : config.output_path;
+    const fs::path input_root = utf8_path(config.input_path);
+    const fs::path output_root = config.output_path.empty()
+        ? input_root
+        : utf8_path(config.output_path);
 
-    if (!fs::exists(output_dir)) {
+    {
         std::error_code ec;
-        fs::create_directories(output_dir, ec);
-        if (ec) {
-            std::cerr << "Error: cannot create output directory: " << output_dir << "\n";
-            return 1;
+        if (!fs::exists(output_root, ec)) {
+            fs::create_directories(output_root, ec);
+            if (ec) {
+                std::cerr << "Error: cannot create output directory: "
+                          << path_to_utf8(output_root) << "\n";
+                return 1;
+            }
         }
     }
 
-    int num_threads = config.num_threads;
-    if (num_threads <= 0) {
-        num_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    // MP3 files cannot be written back; report them up front instead of
+    // silently corrupting them (in-place) or failing late.
+    size_t skipped_mp3 = 0;
+    {
+        std::vector<FileEntry> keep;
+        keep.reserve(entries.size());
+        for (auto& e : entries) {
+            if (AudioReader::detect_format(e.path) == AudioFormat::MP3) {
+                ++skipped_mp3;
+            } else {
+                keep.push_back(std::move(e));
+            }
+        }
+        entries.swap(keep);
     }
-    // Normalization loads full files into memory; cap aggressively to avoid OOM.
-    num_threads = std::min(num_threads, 4);
+    if (skipped_mp3 > 0) {
+        std::cerr << "Warning: skipped " << skipped_mp3
+                  << " MP3 file(s): MP3 output is not supported.\n";
+    }
+    if (entries.empty()) {
+        std::cerr << "Error: no normalizable files (WAV/AIFF) found.\n";
+        return 1;
+    }
+
+    // Normalization holds whole files in memory (decode + write chunk), so
+    // gate admission by a byte budget instead of a blanket low thread cap.
+    const int num_threads = pick_thread_count(config.num_threads, entries.size(),
+                                              /*hard_cap=*/12);
+    const uint64_t budget = std::max<uint64_t>(total_physical_ram() / 3, 1ull << 30);
+    auto estimate_bytes = [](uintmax_t file_size) -> uint64_t {
+        // float expansion (up to 4x for 8-bit, 2x for 16-bit) + write chunk
+        return std::max<uint64_t>(static_cast<uint64_t>(file_size) * 3, 64ull << 20);
+    };
+
+    std::mutex mem_mutex;
+    std::condition_variable mem_cv;
+    uint64_t inflight_bytes = 0;
 
     std::atomic<size_t> next_index{0};
     std::atomic<size_t> completed{0};
@@ -490,26 +635,55 @@ static int process_normalize(const Config& config) {
     std::mutex progress_mutex;
 
     const size_t total = entries.size();
+    const size_t print_every = std::max<size_t>(1, total / 50);
 
     auto worker = [&]() {
         while (!g_cancelled.load(std::memory_order_relaxed)) {
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
             if (idx >= total) break;
 
-            fs::path p(entries[idx].path);
-            std::string output_file = output_dir + "/" + p.filename().string();
+            const uint64_t est = estimate_bytes(entries[idx].size);
+            {
+                std::unique_lock<std::mutex> lk(mem_mutex);
+                mem_cv.wait(lk, [&] {
+                    return inflight_bytes == 0 || inflight_bytes + est <= budget;
+                });
+                inflight_bytes += est;
+            }
 
-            bool ok = Normalizer::normalize_and_save(entries[idx].path, output_file,
-                                                     config.norm_target, config.norm_value);
+            bool ok = false;
+            try {
+                const fs::path in_path = utf8_path(entries[idx].path);
+                std::error_code rel_ec;
+                fs::path rel = fs::relative(in_path, input_root, rel_ec);
+                if (rel_ec || rel.empty()) rel = in_path.filename();
+                fs::path out_path = output_root / rel;
+
+                std::error_code mk_ec;
+                fs::create_directories(out_path.parent_path(), mk_ec);
+
+                ok = Normalizer::normalize_and_save(entries[idx].path,
+                                                    path_to_utf8(out_path),
+                                                    config.norm_target, config.norm_value);
+            } catch (...) {
+                ok = false;
+            }
             (ok ? success_count : fail_count).fetch_add(1, std::memory_order_relaxed);
 
+            {
+                std::lock_guard<std::mutex> lk(mem_mutex);
+                inflight_bytes -= est;
+            }
+            mem_cv.notify_all();
+
             size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
-            std::lock_guard<std::mutex> lock(progress_mutex);
-            if (done == total || done % std::max<size_t>(1, total / 50) == 0) {
+            if (done == total || done % print_every == 0) {
+                std::lock_guard<std::mutex> lock(progress_mutex);
                 std::cerr << "\rNormalizing: " << done << "/" << total
                           << " files..." << std::flush;
             }
         }
+        mem_cv.notify_all();
     };
 
     std::vector<std::thread> threads;
@@ -517,29 +691,37 @@ static int process_normalize(const Config& config) {
     for (int i = 0; i < num_threads; ++i) threads.emplace_back(worker);
     for (auto& t : threads) t.join();
 
-    std::cerr << "\rNormalizing: " << total << "/" << total
+    std::cerr << "\rNormalizing: " << completed.load() << "/" << total
               << " files... Done!\n";
     std::cout << "Success: " << success_count.load()
               << ", Failed: " << fail_count.load() << "\n";
-    std::cout << "Output directory: " << output_dir << "\n";
+    std::cout << "Output directory: " << path_to_utf8(output_root) << "\n";
 
     return (fail_count.load() > 0) ? 1 : 0;
 }
 
 // ============================================================================
-// Main
+// Main (called from cpu_check.cpp after the CPU capability check)
 // ============================================================================
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
+int app_main(int argc, char* argv[]) {
+#if defined(_WIN32)
+    // Console + filenames are handled as UTF-8 end to end.
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
+    std::vector<std::string> args = get_utf8_args(argc, argv);
+
+    if (args.size() < 2) {
         print_usage();
         return 1;
     }
 
     Config config;
-    if (!parse_args(argc, argv, config)) return 1;
+    if (!parse_args(args, config)) return 1;
 
-    if (!fs::exists(config.input_path)) {
+    std::error_code exists_ec;
+    if (!fs::exists(utf8_path(config.input_path), exists_ec)) {
         std::cerr << "Error: Input path does not exist: " << config.input_path << "\n";
         return 1;
     }
@@ -576,7 +758,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (config.csv_output && !config.output_path.empty()) {
-        std::ofstream out(config.output_path, std::ios::binary);
+        std::ofstream out(utf8_path(config.output_path), std::ios::binary);
         if (!out) {
             std::cerr << "Error: Cannot open output file: " << config.output_path << "\n";
             return 1;

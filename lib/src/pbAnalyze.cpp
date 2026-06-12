@@ -3,15 +3,18 @@
  *
  * Provides three analyze() overloads:
  *   - analyze(filepath): convenience, picks the best path automatically.
- *   - analyze(filepath, use_single_pass): legacy single/double pass switch.
+ *   - analyze(filepath, use_single_pass): legacy switch (both values now
+ *     behave identically; kept for API compatibility).
  *   - analyze(AudioData&, source_path): runs on already-loaded data, used by
  *     pbNormalize to avoid loading the same file twice.
  *
- * The "double pass" path was historically slightly faster on long files for
- * RMS-only or Loudness-only output, but always doubled the work when both
- * were requested. We now always use measure_with_rms() (one walk through the
- * audio for both K-weighting and SOX-style RMS) which strictly dominates the
- * old double-pass implementation.
+ * Data-flow notes:
+ *   - The sample peak is scanned ONCE and shared by measure_with_rms and the
+ *     true-peak meter (which also uses it to seed its pruning bound).
+ *   - Files larger than the streaming threshold are analyzed in a single
+ *     streaming pass (loudness + RMS + sample peak + exact oversampled true
+ *     peak); results are identical to the in-memory path, so the choice is
+ *     purely a memory/performance tradeoff.
  */
 
 #include "pbAudioStats.h"
@@ -25,11 +28,24 @@ namespace pb_audio {
 
 namespace {
 
+fs::path utf8_path(const std::string& utf8) {
+#if defined(_WIN32)
+    return fs::u8path(utf8);
+#else
+    return fs::path(utf8);
+#endif
+}
+
 void fill_file_info(AudioStats& stats, const std::string& source_path) {
-    fs::path p(source_path);
+    fs::path p = utf8_path(source_path);
     stats.filepath = source_path;
+#if defined(_WIN32)
+    stats.filename_ext = p.filename().u8string();
+    stats.filename = p.stem().u8string();
+#else
     stats.filename_ext = p.filename().string();
     stats.filename = p.stem().string();
+#endif
 }
 
 void fill_invalid(AudioStats& stats) {
@@ -57,7 +73,11 @@ void run_full_analysis(AudioStats& stats, const AudioData& audio) {
     stats.duration_seconds = audio.duration_seconds();
     stats.duration_formatted = format_duration(stats.duration_seconds);
 
-    auto loudness = LoudnessMeter::measure_with_rms(audio, 50.0);
+    // One shared sample-peak scan (used by both meters below).
+    const double sample_peak_linear = static_cast<double>(
+        simd::find_peak_abs(audio.samples.data(), audio.samples.size()));
+
+    auto loudness = LoudnessMeter::measure_with_rms(audio, 50.0, sample_peak_linear);
     stats.integrated_loudness = loudness.loudness.integrated;
     stats.shortterm_max = loudness.loudness.shortterm_max;
     stats.momentary_max = loudness.loudness.momentary_max;
@@ -68,7 +88,7 @@ void run_full_analysis(AudioStats& stats, const AudioData& audio) {
     stats.rms_max = loudness.rms_max;
     stats.rms_average = loudness.rms_average;
 
-    stats.true_peak = TruePeakMeter::measure(audio);
+    stats.true_peak = TruePeakMeter::measure(audio, sample_peak_linear);
 
     stats.valid = true;
 }
@@ -94,9 +114,9 @@ void run_stream_analysis(AudioStats& stats, AudioStream& stream) {
     stats.rms_max = loudness.rms_max;
     stats.rms_average = loudness.rms_average;
 
-    // Streaming path cannot afford the polyphase oversampling pass without
-    // a second read; report sample peak as a conservative true-peak estimate.
-    stats.true_peak = stats.sample_peak;
+    // Exact BS.1770-4 oversampled true peak, computed in the same streaming
+    // pass (previously this path silently reported the sample peak).
+    stats.true_peak = loudness.true_peak;
 
     stats.valid = true;
 }
@@ -114,16 +134,18 @@ AudioStats analyze(const AudioData& audio, const std::string& source_path) {
     return stats;
 }
 
-AudioStats analyze(const std::string& filepath, bool use_single_pass) {
+AudioStats analyze(const std::string& filepath, bool /*use_single_pass*/) {
     AudioStats stats;
     fill_file_info(stats, filepath);
 
+    // Stream large files: single pass over the data, bounded memory, and
+    // (since the streaming path computes the exact oversampled true peak)
+    // identical results to the in-memory path.
     uintmax_t file_size = 0;
     std::error_code file_size_ec;
-    file_size = fs::file_size(fs::path(filepath), file_size_ec);
+    file_size = fs::file_size(utf8_path(filepath), file_size_ec);
     const uintmax_t stream_threshold_bytes = 32ull * 1024ull * 1024ull;
-    bool use_stream = use_single_pass && !file_size_ec &&
-                      file_size > stream_threshold_bytes;
+    const bool use_stream = !file_size_ec && file_size > stream_threshold_bytes;
 
     if (use_stream) {
         auto stream = AudioReader::open_stream(filepath);
